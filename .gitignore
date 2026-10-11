@@ -1,0 +1,12 @@
+# MATLAB autosave and backup files
+*.asv
+*.autosave
+*.m~
+
+# MATLAB / Simulink generated files
+*.slxc
+slprj/
+codegen/
+
+# Temporary files
+*.tmp
