@@ -26,12 +26,18 @@ disp("PASS: RL environment reset/step integration.");
 scenarioState = initialState;
 p = scenarioState.params;
 p.workspaceBox = cfg.box;
-halfWidths = deg2rad([10 20 10 15 10 15 10]).';
+% Wider joint-space candidates; FK and collision rejection still enforce
+% reachable start/goal positions inside the unchanged TA workspace.
+halfWidths = deg2rad([30 40 30 30 30 35 40]).';
 qCenter = qReady(:);
-p.goalJointRanges = [qCenter-halfWidths, qCenter+halfWidths];
+jointRanges = [max(qCenter-halfWidths, jointLimits(:,1)), ...
+               min(qCenter+halfWidths, jointLimits(:,2))];
+assert(all(jointRanges(:,1) < jointRanges(:,2)), ...
+    "Invalid calibrated joint-sampling interval.");
+p.goalJointRanges = jointRanges;
 p.maxTargetAttempts = 200;
-p.minTargetDistance = 0.12;
-p.maxTargetDistance = 0.20;
+p.minTargetDistance = 0.20;
+p.maxTargetDistance = 0.30;
 
 if randomizeStarts
     p.startJointRanges = p.goalJointRanges;
@@ -52,7 +58,7 @@ rng(diagnosticSeed, "twister");
 episodes = cell(nEpisodes,1);
 resetTimes = zeros(nEpisodes,1);
 status = strings(nEpisodes,1);
-counts = zeros(nEpisodes,4); % [target, start, goal, accepted]
+counts = zeros(nEpisodes,5); % [target, start, goal, workspace, accepted]
 distances = nan(nEpisodes,1);
 deltaXYZ = nan(nEpisodes,3);
 lineClearance = nan(nEpisodes,1);
@@ -66,11 +72,12 @@ for k = 1:nEpisodes
 
     assert(d.attempts == d.targetPointRejects + ...
            d.startCollisionRejects + d.goalCollisionRejects + ...
-           double(d.acceptedAttempt > 0), ...
+           d.workspaceRejects + double(d.acceptedAttempt > 0), ...
            "Obstacle rejection accounting error at episode %d.", k);
 
     counts(k,:) = [d.targetPointRejects, d.startCollisionRejects, ...
-                   d.goalCollisionRejects, double(d.acceptedAttempt > 0)];
+                   d.goalCollisionRejects, d.workspaceRejects, ...
+                   double(d.acceptedAttempt > 0)];
     if ~isempty(episodeObs)
         assert(d.success && isequal(size(episodeObs), [14 1]), ...
             "Accepted reset returned an invalid observation.");
@@ -110,9 +117,9 @@ fprintf("Accepted: %d/%d | Failed: %d\n", nAccepted,nEpisodes,nEpisodes-nAccepte
 fprintf("Failures: start=%d target=%d obstacle=%d\n", ...
     nnz(status=="start"),nnz(status=="target"),nnz(status=="obstacle"));
 fprintf("Sphere candidates: %d\n",sum(counts,"all"));
-fprintf("Rejected target/start/goal: %d / %d / %d\n", ...
-    sum(counts(:,1)),sum(counts(:,2)),sum(counts(:,3)));
-fprintf("Accepted sphere candidates: %d\n",sum(counts(:,4)));
+fprintf("Rejected target/start/goal/workspace: %d / %d / %d / %d\n", ...
+    sum(counts(:,1)),sum(counts(:,2)),sum(counts(:,3)),sum(counts(:,4)));
+fprintf("Accepted sphere candidates: %d\n",sum(counts(:,5)));
 fprintf("Reset time: median %.1f ms | max %.1f ms\n", ...
     median(resetTimes)*1000,max(resetTimes)*1000);
 validDistance = distances(isfinite(distances));
@@ -246,8 +253,9 @@ function renderSelectedScenario(data,selection)
             min(32,numel(rejected)))));
         centers=d.candidateCenters(subset,:);
         cc=d.candidateCodes(subset);
-        palette=[0.70 0.70 0.70; 0.88 0.31 0.36;0.99 0.64 0.22];
-        for code=1:3
+        palette=[0.70 0.70 0.70; 0.88 0.31 0.36; ...
+                 0.99 0.64 0.22; 0 0 0; 0.55 0.63 0.78];
+        for code=[1 2 3 5]
             m=cc==code;
             if any(m)
                 scatter3(ax,centers(m,1),centers(m,2),centers(m,3), ...
