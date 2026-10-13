@@ -52,8 +52,32 @@ for i = 1:robot.NumBodies
 end
 
 skipPairs(end,:) = {'panda_link7', 'panda_hand'};
+%% Validated Reference Configuration
+% Reference configuration for simulation and testing.
+% Fixed gripper opening, with self-collision validation.
+
+qReference = qHome;
+
+% Adjust joint 6
+qReference(6) = mean(jointLimits(6,:));
+
+% Fixed gripper opening
+left = getBody(robot, "panda_leftfinger");
+right = getBody(robot, "panda_rightfinger");
+
+qReference(8) = mean(left.Joint.PositionLimits);
+qReference(9) = mean(right.Joint.PositionLimits);
+
+% Verify joint limits
+assert(all(qReference(1:7) >= jointLimits(:,1).' & ...
+           qReference(1:7) <= jointLimits(:,2).'));
+
+% Verify self-collision
+assert(~checkCollision(robot, qReference, ...
+    "SkippedSelfCollisions", skipPairs), ...
+    "Reference configuration is self-colliding.");
 
 % Visualize robot
 figure;
-show(robot, qHome);
+show(robot, qReference);
 axis equal;
