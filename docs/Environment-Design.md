@@ -11,7 +11,7 @@ Status: **Pre-training validation**; do not interpret unexecuted code as a passe
 - Agent actions: seven joint increments, each bounded by $|\Delta q_i| \le 0.01$ rad per step.
 - Sampling period: 0.05 s; horizon: 400 steps; positional success tolerance: 0.02 m.
 - One stationary spherical obstacle. Full-arm collision checking; feasible avoidance routes are required.
-- The **agent** selects all actions. IK, RRT, and nominal joint interpolation are **not** used in the policy loop.
+- The **agent** selects all actions. Offline diagnostics do not select policy actions.
 
 ## Existing architecture
 
@@ -55,31 +55,22 @@ The MATLAB results supplied for the **local 3 cm sphere configuration** showed:
 
 These tests prove the sphere obstructs nominal whole-arm motion, **not** that alternative routes exist. The GitHub `main` diagnostic factory still defines a 5 cm placeholder sphere; local uncommitted settings must not be silently overwritten.
 
-## First incremental addition: offline route-feasibility audit
+## Current scope
 
-Location: `tests/testEnvironment.m`, section `5B`.
+The environment keeps the core reset/step functions and the two test-only nominal-motion collision diagnostics. Optional motion-planner feasibility code has been removed from the test suite to keep the implementation focused.
 
-- Test **only**: use built-in MathWorks `manipulatorRRT` on a copy of the robot.
-- Replace both finger joints with fixed joints, preserving their original geometry at the 0.04 m opening; validate the transformed geometry before planning.
-- Disable the RRT connect heuristic to retain self-collision checks.
-- Use a bounded, seeded search on the first **two** accepted direct-motion-blocked scenarios.
-- Independently recheck any returned path on the **original nine-joint model**, restoring the fixed finger coordinates.
-- Reject candidate paths with joint-limit violations, any detected collision, or more than 400 actions when sampled at at most 0.01 rad per joint.
-- Report three distinct outcomes: verified feasible route, found route exceeding horizon / invalid, or planner search inconclusive.
-
-**Important:** The new audit is source-checked on GitHub but has **not yet been run in MATLAB**. An RRT failure is not evidence of an impossible scenario. Finite-resolution collision checking is not a continuous swept-volume guarantee.
+Two alternative paths were validated in a previous exploratory MATLAB run (131 and 224 joint-increment steps). This **does not establish feasibility for the full randomized distribution**. Collision-free endpoints alone never guarantee an avoidance route. A rigorous future evaluation should address this course requirement, without supplying paths to the RL policy.
 
 ## Remaining pre-training work
 
-1. Run and evaluate the new offline route audit; then expand feasibility evidence to the randomized scenario distribution without using planned paths to control the RL agent.
-2. Eliminate random reset-exhaustion errors for real training runs.
-3. Establish an easy-to-hard curriculum, preserving separate train and held-out evaluation seeds.
-4. Review reward scale, potential reward exploitation, and finite-horizon state sufficiency.
-5. Benchmark step execution before attempting optimization.
-6. Train and compare two continuous-control agents, then evaluate frozen policies against a conventional IK-based baseline and unseen scenarios.
+1. Establish a dependable basic RL training scenario; retain the assignment's feasible-route requirement and explicitly label randomized feasibility as not yet guaranteed.
+2. Eliminate randomized reset-exhaustion errors before unattended training.
+3. Review reward scale and behavior; test observation correctness and terminal conditions.
+4. Benchmark environment-step execution before optimizing.
+5. Add a gradual curriculum and separated training/evaluation seeds.
+6. Train and compare two continuous-control agents; evaluate frozen policies on unseen cases and compare with the conventional IK baseline.
 
 ## References
 
 - MathWorks: [`rlFunctionEnv`](https://www.mathworks.com/help/reinforcement-learning/ref/rl.env.rlfunctionenv.html)
-- MathWorks: [`manipulatorRRT`](https://www.mathworks.com/help/robotics/ref/manipulatorrrt.html), [`plan`](https://www.mathworks.com/help/robotics/ref/manipulatorrrt.plan.html)
 - Xu et al. (2024), *Open-Source Reinforcement Learning Environments Implemented in MuJoCo with Franka Manipulator*, arXiv:2312.13788 — architectural inspiration, not a specification for this MATLAB implementation.
