@@ -747,3 +747,66 @@ for k = 1:10
 end
 
 disp("PASS: Randomized workspace sampling validated.");
+
+
+%% Test 21: Opt-in reset diagnostics preserve normal sampling behavior
+% With identical RNG seeds, collecting diagnostics must not change the
+% accepted episode, observation, or random-number consumption.
+diagnosticState = obstacleState;
+diagnosticState.params.recordScenarioDiagnostics = true;
+savedRng = rng;
+rng(44, "twister");
+[regularObs, regularReset] = environment.resetFunction(obstacleState);
+regularRng = rng;
+rng(44, "twister");
+[diagnosticObs, diagnosticReset] = environment.resetFunction(diagnosticState);
+diagnosticRng = rng;
+rng(savedRng);
+
+assert(isequal(regularObs, diagnosticObs) && ...
+       isequal(regularReset.obstacle.Pose, diagnosticReset.obstacle.Pose) && ...
+       isequal(regularReset.q, diagnosticReset.q) && ...
+       isequal(regularRng, diagnosticRng), ...
+       "Diagnostics changed reset sampling or RNG consumption.");
+diag = diagnosticReset.scenarioDiagnostics;
+assert(diag.success && diag.acceptedAttempt >= 1 && ...
+       diag.attempts == diag.targetPointRejects + ...
+       diag.startCollisionRejects + diag.goalCollisionRejects + 1 && ...
+       numel(diag.candidateCodes) == diag.attempts, ...
+       "Opt-in reset diagnostic accounting failed.");
+assert(~isfield(regularReset,"scenarioDiagnostics"), ...
+       "Ordinary reset unexpectedly retained diagnostics.");
+disp("PASS: Optional reset diagnostics preserve normal behavior.");
+
+%% Test 22: Failed diagnostic reset returns rejection data
+failedDiagnostic = state;
+failedDiagnostic.obstacle = collisionSphere(2.0);
+failedDiagnostic.obstacle.Pose = trvec2tform([3,3,3]);
+failedDiagnostic.params.obstacleFractionRange = [0.4 0.6];
+failedDiagnostic.params.obstacleOffsetRange = [0.02 0.08];
+failedDiagnostic.params.maxObstacleAttempts = 3;
+failedDiagnostic.params.recordScenarioDiagnostics = true;
+
+[failedObs,failedState] = environment.resetFunction(failedDiagnostic);
+failureDiag = failedState.scenarioDiagnostics;
+assert(isempty(failedObs) && ~failureDiag.success && ...
+       failureDiag.failureStage == "obstacle" && ...
+       failureDiag.attempts == 3 && ...
+       failureDiag.targetPointRejects + ...
+       failureDiag.startCollisionRejects + ...
+       failureDiag.goalCollisionRejects == 3, ...
+       "Failure diagnostics were lost on obstacle exhaustion.");
+
+ordinaryFailure = rmfield(failedDiagnostic,"params");
+ordinaryFailure.params = rmfield(failedDiagnostic.params, ...
+    "recordScenarioDiagnostics");
+caughtExhaustion = false;
+try
+    environment.resetFunction(ordinaryFailure);
+catch ME
+    caughtExhaustion = contains(ME.message, ...
+        "no valid obstacle within attempt limit");
+end
+assert(caughtExhaustion, ...
+    "Ordinary RL reset must still throw on obstacle exhaustion.");
+disp("PASS: Failed reset diagnostics retained without changing RL errors.");
