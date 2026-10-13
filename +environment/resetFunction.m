@@ -23,6 +23,7 @@ function [InitialObs, LoggedSignals] = resetFunction(initialState)
             "failureStage", "", ...
             "attempts", 0, ...
             "targetPointRejects", 0, ...
+            "workspaceRejects", 0, ...
             "startCollisionRejects", 0, ...
             "goalCollisionRejects", 0, ...
             "acceptedAttempt", 0, ...
@@ -267,9 +268,11 @@ end
                maxAttempts == floor(maxAttempts), ...
                "Invalid obstacle attempt limit.");
 
+        obstacleRadius = LoggedSignals.obstacle.Radius;
+
         if recordDiagnostics
             % Codes: 1=target overlap, 2=start robot, 3=goal robot,
-            % 4=accepted. Store centers so failures can be visualized.
+            % 4=accepted, 5=outside workspace.
             diag.candidateCenters = zeros(maxAttempts, 3);
             diag.candidateCodes = zeros(maxAttempts, 1, "uint8");
         end
@@ -302,13 +305,25 @@ end
             center = pStart + alpha*segment + ...
                 rho*(cos(theta)*lateral1 + sin(theta)*lateral2);
 
-            candidate = collisionSphere(LoggedSignals.obstacle.Radius);
-            candidate.Pose = trvec2tform(center.');
-
             if recordDiagnostics
                 diag.attempts = attempt;
                 diag.candidateCenters(attempt,:) = center.';
             end
+
+            % Keep the entire sphere inside the specified workspace.
+            % No workspaceBox means unrestricted diagnostic geometry.
+            if useWorkspaceBox && any( ...
+                    center - obstacleRadius < workspaceBox(:,1) | ...
+                    center + obstacleRadius > workspaceBox(:,2))
+                if recordDiagnostics
+                    diag.workspaceRejects = diag.workspaceRejects + 1;
+                    diag.candidateCodes(attempt) = 5;
+                end
+                continue;
+            end
+
+            candidate = collisionSphere(obstacleRadius);
+            candidate.Pose = trvec2tform(center.');
 
             % Reject spheres overlapping the goal point or endpoint poses.
             if norm(center - LoggedSignals.target) <= candidate.Radius
