@@ -207,6 +207,63 @@ fprintf("NOTE: Discrete checks (<=%.3f rad/joint per sample) do not prove\n", ..
 fprintf("continuous swept-path clearance or existence of another route.\n");
 disp("PASS: Whole-arm nominal motion diagnostic completed.");
 
+%% 5A. Obstacle-free reference check (TEST ONLY)
+% Use the same joint-space samples. Never provide this reference to RL.
+% A trajectory collision-free WITH the sphere must also be self-free
+% without it, so only recheck cases blocked in the original test.
+obstacleFreeSelfBlocked = false(nEpisodes,1);
+
+for episodeIndex = acceptedEpisodes.'
+    if ~nominalBlocked(episodeIndex)
+        continue; % Existing full-arm check covered every sample.
+    end
+    if nominalSelfCollision(episodeIndex)
+        obstacleFreeSelfBlocked(episodeIndex) = true;
+        continue; % Self-collision was already detected.
+    end
+
+    episode = episodes{episodeIndex};
+    qStart = episode.q;
+    dq = episode.sampledGoalQ(1:7) - qStart(1:7);
+    nSteps = nominalSteps(episodeIndex);
+
+    for sampleIndex = 1:nSteps
+        qSample = qStart;
+        qSample(1:7) = qStart(1:7) + (sampleIndex/nSteps)*dq;
+
+        if any(checkCollision(episode.robot,qSample, ...
+                "SkippedSelfCollisions",episode.params.skipPairs))
+            obstacleFreeSelfBlocked(episodeIndex) = true;
+            break;
+        end
+    end
+end
+
+withSphereBlocked = nominalBlocked(acceptedEpisodes);
+withoutSphereBlocked = obstacleFreeSelfBlocked(acceptedEpisodes);
+blockedOnlyWithSphere = nnz(withSphereBlocked & ~withoutSphereBlocked);
+blockedBothWays = nnz(withSphereBlocked & withoutSphereBlocked);
+clearBothWays = nnz(~withSphereBlocked & ~withoutSphereBlocked);
+
+assert(~any(~withSphereBlocked & withoutSphereBlocked), ...
+    "Obstacle-free reference contradicts whole-arm collision checks.");
+assert(blockedOnlyWithSphere + blockedBothWays + clearBothWays == ...
+       numel(acceptedEpisodes), "Reference-motion accounting mismatch.");
+
+fprintf("\n=== Obstacle-Free Whole-Arm Reference ===\n");
+fprintf("Accepted scenarios compared: %d\n",numel(acceptedEpisodes));
+fprintf("Self-colliding without sphere: %d/%d\n", ...
+    nnz(withoutSphereBlocked),numel(acceptedEpisodes));
+fprintf("Clear without sphere, blocked with sphere: %d/%d\n", ...
+    blockedOnlyWithSphere,numel(acceptedEpisodes));
+fprintf("Blocked with and without sphere: %d/%d\n", ...
+    blockedBothWays,numel(acceptedEpisodes));
+fprintf("Clear with and without sphere: %d/%d\n", ...
+    clearBothWays,numel(acceptedEpisodes));
+fprintf("NOTE: Discrete checks do not prove continuous swept-path\n");
+fprintf("clearance or a feasible alternative route.\n");
+disp("PASS: Obstacle-free reference comparison completed.");
+
 %% 6. Two-pane interactive inspection, using the SAME episodes as report
 if doVisualize
     available = find(isfinite(distances));  % includes obstacle-placement failures
