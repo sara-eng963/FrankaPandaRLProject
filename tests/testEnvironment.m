@@ -138,7 +138,76 @@ end
 fprintf("NOTE: Endpoint safety and EE line clearance do not establish a feasible whole-arm route.\n");
 disp("PASS: Online diagnostic accounting verified.");
 
-%% 5. Two-pane interactive inspection, using the SAME episodes as report
+%% 5. Nominal whole-arm motion diagnostic (testing ONLY)
+% Straight interpolation in JOINT space is a geometric reference, not
+% an RL action, demonstration, Cartesian EE path, or motion planner.
+% Sample increments are at most the course's 0.01 rad per joint.
+acceptedEpisodes = find(status == "accepted");
+nominalBlocked = false(nEpisodes,1);
+nominalSelfCollision = false(nEpisodes,1);
+nominalObstacleOnly = false(nEpisodes,1);
+nominalSteps = nan(nEpisodes,1);
+
+for episodeIndex = acceptedEpisodes.'
+    episode = episodes{episodeIndex};
+    assert(isfield(episode,"sampledGoalQ"), ...
+        "Accepted randomized episode lacks its sampled goal configuration.");
+
+    qStart = episode.q;
+    qGoal = episode.sampledGoalQ;
+    assert(isequal(size(qStart),[1 9]) && isequal(size(qGoal),[1 9]), ...
+        "Invalid start or goal configuration at episode %d.",episodeIndex);
+
+    dq = qGoal(1:7) - qStart(1:7);
+    nSteps = max(1,ceil(max(abs(dq))/episode.params.maxIncrement));
+    nominalSteps(episodeIndex) = nSteps;
+
+    for sampleIndex = 1:nSteps
+        qSample = qStart;
+        qSample(1:7) = qStart(1:7) + (sampleIndex/nSteps)*dq;
+
+        if collision.checkRobotCollision(episode.robot,qSample, ...
+                episode.obstacle,episode.params.skipPairs)
+            nominalBlocked(episodeIndex) = true;
+            % A self-collision at this sample may coexist with an
+            % obstacle collision; only a self-free sample establishes
+            % that the obstacle alone obstructs this nominal motion.
+            nominalSelfCollision(episodeIndex) = checkCollision( ...
+                episode.robot,qSample, ...
+                "SkippedSelfCollisions",episode.params.skipPairs);
+            nominalObstacleOnly(episodeIndex) = ...
+                ~nominalSelfCollision(episodeIndex);
+            break;
+        end
+    end
+end
+
+nBlocked = nnz(nominalBlocked(acceptedEpisodes));
+nObstacleOnly = nnz(nominalObstacleOnly(acceptedEpisodes));
+nSelfCollision = nnz(nominalSelfCollision(acceptedEpisodes));
+nDirectClear = numel(acceptedEpisodes)-nBlocked;
+nExceedsHorizon = nnz(nominalSteps(acceptedEpisodes)>cfg.maxSteps);
+nDirectFeasible = nnz(~nominalBlocked(acceptedEpisodes) & ...
+    nominalSteps(acceptedEpisodes)<=cfg.maxSteps);
+
+fprintf("\n=== Whole-Arm Nominal Motion Diagnostic ===\n");
+fprintf("Accepted scenarios tested: %d\n",numel(acceptedEpisodes));
+fprintf("Direct joint-space interpolation blocked: %d/%d\n", ...
+    nBlocked,numel(acceptedEpisodes));
+fprintf("First collision: obstacle-only=%d | self (possibly both)=%d\n", ...
+    nObstacleOnly,nSelfCollision);
+fprintf("Collision-free at sampled configurations: %d/%d\n", ...
+    nDirectClear,numel(acceptedEpisodes));
+fprintf("Direct interpolation exceeds %d-step horizon: %d\n", ...
+    cfg.maxSteps,nExceedsHorizon);
+fprintf("Sampled collision-free and within horizon: %d/%d\n", ...
+    nDirectFeasible,numel(acceptedEpisodes));
+fprintf("NOTE: Discrete checks (<=%.3f rad/joint per sample) do not prove\n", ...
+    cfg.maxIncrement);
+fprintf("continuous swept-path clearance or existence of another route.\n");
+disp("PASS: Whole-arm nominal motion diagnostic completed.");
+
+%% 6. Two-pane interactive inspection, using the SAME episodes as report
 if doVisualize
     available = find(isfinite(distances));  % includes obstacle-placement failures
     if isempty(available)
