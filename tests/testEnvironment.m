@@ -78,7 +78,9 @@ for k = 1:nEpisodes
         assert(~d.success && strlength(d.failureStage) > 0, ...
             "Failed diagnostic reset lacks a failure stage.");
     end
-    if isfield(s,"pEE") && isfield(s,"target") && ...
+    % Start/target data is meaningful only after both endpoints were
+    % sampled; an early failure may still contain initialState placeholders.
+    if (d.success || d.failureStage == "obstacle") && ...
             all(isfinite(s.pEE)) && all(isfinite(s.target))
         deltaXYZ(k,:) = (s.target - s.pEE).';
         distances(k) = norm(s.target - s.pEE);
