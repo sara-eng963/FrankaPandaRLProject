@@ -608,3 +608,142 @@ assert(isequal(obsA, obsB), ...
     "Reset depends on an obstacle that should be replaced.");
 
 disp("PASS: Reset independent of discarded obstacle.");
+
+
+%% Test 19: Cartesian Workspace Constraints
+% Workspace bounds apply to episode starts and targets.
+
+workspaceState = state;
+workspaceState.params.workspaceBox = cfg.box;
+
+% Valid start and target must be accepted.
+[obs, s] = environment.resetFunction(workspaceState);
+
+assert(all(s.pEE >= cfg.box(:,1) & ...
+           s.pEE <= cfg.box(:,2)));
+
+assert(all(s.target >= cfg.box(:,1) & ...
+           s.target <= cfg.box(:,2)));
+
+assert(all(isfinite(obs)));
+
+% Reject a starting position outside the workspace.
+invalidStart = workspaceState;
+invalidStart.params.workspaceBox(1,1) = s.pEE(1) + 0.01;
+
+rejected = false;
+try
+    environment.resetFunction(invalidStart);
+catch ME
+    if contains(ME.message, "Initial position is outside")
+        rejected = true;
+    else
+        rethrow(ME);
+    end
+end
+
+assert(rejected, "Out-of-workspace start was accepted.");
+
+% Reject a target outside the workspace.
+invalidTarget = workspaceState;
+invalidTarget.target(1) = cfg.box(1,2) + 0.05;
+
+rejected = false;
+try
+    environment.resetFunction(invalidTarget);
+catch ME
+    if contains(ME.message, "Target position is outside")
+        rejected = true;
+    else
+        rethrow(ME);
+    end
+end
+
+assert(rejected, "Out-of-workspace target was accepted.");
+
+disp("PASS: Cartesian workspace constraints validated.");
+
+
+%% Test 20: Randomized Workspace Sampling
+% Reject out-of-bounds samples and accept valid start/target pairs.
+
+workspaceState = state;
+workspaceState.params.workspaceBox = cfg.box;
+
+% Construct a collision-free configuration whose EE is
+% outside the TA's workspace.
+qOutside = qReference;
+qOutside(1) = deg2rad(35);
+
+TOutside = kinematics.forwardKinematics( ...
+    robot, qOutside, eeFrame);
+pOutside = TOutside(1:3,4);
+
+assert(pOutside(1) < cfg.box(1,1), ...
+    "Invalid test fixture: candidate is inside workspace.");
+
+assert(~collision.checkRobotCollision( ...
+    robot, qOutside, obstacle, skipPairs), ...
+    "Invalid test fixture: candidate is colliding.");
+
+% Narrow ranges around the invalid configuration.
+qCenter = qOutside(1:7).';
+delta = 1e-4;
+outsideRanges = [qCenter-delta, qCenter+delta];
+
+% A. Randomized starts must reject out-of-bounds samples.
+invalidStart = workspaceState;
+invalidStart.params.startJointRanges = outsideRanges;
+invalidStart.params.maxResetAttempts = 5;
+
+rejected = false;
+try
+    environment.resetFunction(invalidStart);
+catch ME
+    rejected = contains(ME.message, ...
+        "no valid start within attempt limit");
+end
+assert(rejected, "Out-of-bounds randomized start accepted.");
+
+% B. Randomized targets must reject out-of-bounds samples.
+invalidGoal = workspaceState;
+invalidGoal.params.goalJointRanges = outsideRanges;
+invalidGoal.params.maxTargetAttempts = 5;
+invalidGoal.params.minTargetDistance = 0.03;
+
+rejected = false;
+try
+    environment.resetFunction(invalidGoal);
+catch ME
+    rejected = contains(ME.message, ...
+        "no valid target within attempt limit");
+end
+assert(rejected, "Out-of-bounds randomized target accepted.");
+
+% C. Verify successful sampling from an admissible region.
+validState = workspaceState;
+qCenter = qReference(1:7).';
+
+startDelta = 5e-4;
+validState.params.startJointRanges = ...
+    [qCenter-startDelta, qCenter+startDelta];
+
+goalRanges = [qCenter-startDelta, qCenter+startDelta];
+goalRanges(1,:) = [0.12, 0.15];
+
+validState.params.goalJointRanges = goalRanges;
+validState.params.maxResetAttempts = 50;
+validState.params.maxTargetAttempts = 50;
+validState.params.minTargetDistance = 0.03;
+
+for k = 1:10
+    [~, s] = environment.resetFunction(validState);
+
+    assert(all(s.pEE >= cfg.box(:,1) & ...
+               s.pEE <= cfg.box(:,2)));
+
+    assert(all(s.target >= cfg.box(:,1) & ...
+               s.target <= cfg.box(:,2)));
+end
+
+disp("PASS: Randomized workspace sampling validated.");
