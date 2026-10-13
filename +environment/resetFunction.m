@@ -13,6 +13,23 @@ function [InitialObs, LoggedSignals] = resetFunction(initialState)
     randomizeObstacle = isfield(p, "obstacleFractionRange");
     useWorkspaceBox = isfield(p, "workspaceBox");
 
+    % Optional diagnostics are strictly opt-in. Standard RL resets retain
+    % their original exception behavior and observation layout.
+    recordDiagnostics = isfield(p, "recordScenarioDiagnostics") && ...
+        isequal(p.recordScenarioDiagnostics, true);
+    if recordDiagnostics
+        diag = struct( ...
+            "success", false, ...
+            "failureStage", "", ...
+            "attempts", 0, ...
+            "targetPointRejects", 0, ...
+            "startCollisionRejects", 0, ...
+            "goalCollisionRejects", 0, ...
+            "acceptedAttempt", 0, ...
+            "candidateCenters", zeros(0,3), ...
+            "candidateCodes", zeros(0,1,"uint8"));
+    end
+
     assert(isequal(size(q), [1, 9]) && all(isfinite(q)), ...
         "Invalid initial joint configuration.");
 
@@ -83,8 +100,15 @@ function [InitialObs, LoggedSignals] = resetFunction(initialState)
             break;
         end
 
-        assert(accepted, ...
-            "Reset failed: no valid start within attempt limit.");
+        if ~accepted
+            if recordDiagnostics
+                diag.failureStage = "start";
+                LoggedSignals.scenarioDiagnostics = diag;
+                InitialObs = [];
+                return;
+            end
+            error("Reset failed: no valid start within attempt limit.");
+        end
     else
         assert(all(q(1:7) >= p.jointLimits(:,1).') && ...
                all(q(1:7) <= p.jointLimits(:,2).'), ...
@@ -197,8 +221,15 @@ end
             break;
         end
 
-        assert(accepted, ...
-            "Reset failed: no valid target within attempt limit.");
+        if ~accepted
+            if recordDiagnostics
+                diag.failureStage = "target";
+                LoggedSignals.scenarioDiagnostics = diag;
+                InitialObs = [];
+                return;
+            end
+            error("Reset failed: no valid target within attempt limit.");
+        end
     end
 
     assert(isequal(size(LoggedSignals.target), [3, 1]) && ...
@@ -236,6 +267,13 @@ end
                maxAttempts == floor(maxAttempts), ...
                "Invalid obstacle attempt limit.");
 
+        if recordDiagnostics
+            % Codes: 1=target overlap, 2=start robot, 3=goal robot,
+            % 4=accepted. Store centers so failures can be visualized.
+            diag.candidateCenters = zeros(maxAttempts, 3);
+            diag.candidateCodes = zeros(maxAttempts, 1, "uint8");
+        end
+
         segment = LoggedSignals.target - pStart;
         segmentLength = norm(segment);
 
@@ -267,28 +305,65 @@ end
             candidate = collisionSphere(LoggedSignals.obstacle.Radius);
             candidate.Pose = trvec2tform(center.');
 
+            if recordDiagnostics
+                diag.attempts = attempt;
+                diag.candidateCenters(attempt,:) = center.';
+            end
+
             % Reject spheres overlapping the goal point or endpoint poses.
             if norm(center - LoggedSignals.target) <= candidate.Radius
+                if recordDiagnostics
+                    diag.targetPointRejects = diag.targetPointRejects + 1;
+                    diag.candidateCodes(attempt) = 1;
+                end
                 continue;
             end
 
             if collision.checkRobotCollision( ...
                     LoggedSignals.robot, q, candidate, p.skipPairs)
+                if recordDiagnostics
+                    diag.startCollisionRejects = diag.startCollisionRejects + 1;
+                    diag.candidateCodes(attempt) = 2;
+                end
                 continue;
             end
 
             if randomizeTarget && collision.checkRobotCollision( ...
                     LoggedSignals.robot, qGoal, candidate, p.skipPairs)
+                if recordDiagnostics
+                    diag.goalCollisionRejects = diag.goalCollisionRejects + 1;
+                    diag.candidateCodes(attempt) = 3;
+                end
                 continue;
             end
 
             LoggedSignals.obstacle = candidate;
+            if recordDiagnostics
+                diag.candidateCodes(attempt) = 4;
+                diag.acceptedAttempt = attempt;
+            end
             accepted = true;
             break;
         end
 
-        assert(accepted, ...
-            "Reset failed: no valid obstacle within attempt limit.");
+        if recordDiagnostics
+            diag.candidateCenters = diag.candidateCenters(1:diag.attempts,:);
+            diag.candidateCodes = diag.candidateCodes(1:diag.attempts);
+        end
+        if ~accepted
+            if recordDiagnostics
+                diag.failureStage = "obstacle";
+                LoggedSignals.scenarioDiagnostics = diag;
+                InitialObs = [];
+                return;
+            end
+            error("Reset failed: no valid obstacle within attempt limit.");
+        end
+    end
+
+    if recordDiagnostics
+        diag.success = true;
+        LoggedSignals.scenarioDiagnostics = diag;
     end
 
     %% 4. Episode State and Observation
