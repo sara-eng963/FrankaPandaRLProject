@@ -146,7 +146,7 @@ if doVisualize
 
         hold(overviewAx,"on");
         drawWorkspaceBox(overviewAx,cfg.box);
-        [sphereX,sphereY,sphereZ] = sphere(16);
+        % Call the function explicitly: testStepFunction.m leaves a\n        % collisionSphere variable named "sphere" in the base workspace.\n        [sphereX,sphereY,sphereZ] = feval("sphere",16);
 
         for j = 1:numel(available)
             ep = episodes{available(j)};
