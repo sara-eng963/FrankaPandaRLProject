@@ -9,9 +9,6 @@ nEpisodes = 30;
 maxVisibleScenarios = 12;
 randomizeStarts = true;  % Set false to reproduce the previous fixed-start diagnostic.
 diagnosticSeed = 2026;  % Never use cfg.evalSeed for development.
-doFeasibilityCheck = true; % Test-only RRT, not used by RL.
-maxFeasibilityCases = 2;   % Keep the first exploratory run bounded.
-feasibilityMaxIterations = 750;
 
 %% 1. RL Toolbox integration
 projectRoot = fileparts(fileparts(mfilename("fullpath")));
@@ -267,105 +264,6 @@ fprintf("NOTE: Discrete checks do not prove continuous swept-path\n");
 fprintf("clearance or a feasible alternative route.\n");
 disp("PASS: Obstacle-free reference comparison completed.");
 
-%% 5B. Offline route-feasibility audit (NEVER used by RL)
-% MathWorks manipulatorRRT supplies candidate joint-space paths. A separate
-% check against the ORIGINAL 9-joint robot validates fixed fingers, joint
-% limits, full-arm collision, and the course's action/episode limits.
-if doFeasibilityCheck
-    blockedEpisodes = acceptedEpisodes(nominalBlocked(acceptedEpisodes));
-    selectedEpisodes = blockedEpisodes(1:min( ...
-        maxFeasibilityCases,numel(blockedEpisodes)));
-
-    % The built-in Panda model also has two movable finger joints. Fix
-    % them at the course's constant opening in a TEST-ONLY robot copy.
-    planningRobot = fixedGripperPlanningRobot(robot,qReference);
-    planningRng = rng;
-    planningRngGuard = onCleanup(@() rng(planningRng));
-
-    outcome = strings(numel(selectedEpisodes),1);
-    plannedSteps = nan(numel(selectedEpisodes),1);
-    planningTimes = nan(numel(selectedEpisodes),1);
-    for caseIndex = 1:numel(selectedEpisodes)
-        episodeIndex = selectedEpisodes(caseIndex);
-        episode = episodes{episodeIndex};
-        planner = manipulatorRRT(planningRobot,{episode.obstacle});
-        planner.SkippedSelfCollisions = skipPairs;
-        % The connect heuristic otherwise skips some self-collision checks.
-        planner.EnableConnectHeuristic = false;
-        planner.ValidationDistance = cfg.maxIncrement;
-        planner.MaxIterations = feasibilityMaxIterations;
-
-        rng(diagnosticSeed + 1000 + episodeIndex,"twister");
-        timer = tic;
-        [path,solution] = plan(planner,episode.q(1:7), ...
-            episode.sampledGoalQ(1:7));
-        planningTimes(caseIndex) = toc(timer);
-
-        if ~solution.IsPathFound || isempty(path)
-            outcome(caseIndex) = "unverified: planner failed";
-            continue;
-        end
-
-        assert(size(path,2)==7 && size(path,1)>=2, ...
-            "Unexpected planner output at episode %d.",episodeIndex);
-        assert(norm(path(1,:)-episode.q(1:7),Inf)<1e-8 && ...
-               norm(path(end,:)-episode.sampledGoalQ(1:7),Inf)<1e-8, ...
-            "Planner returned incorrect path endpoints.");
-
-        totalSteps = 0;
-        collisionFree = true;
-        for segmentIndex = 1:size(path,1)-1
-            jointDelta = path(segmentIndex+1,:)-path(segmentIndex,:);
-            nSegmentSteps = max(1,ceil( ...
-                max(abs(jointDelta))/cfg.maxIncrement));
-            totalSteps = totalSteps + nSegmentSteps;
-
-            for sampleIndex = 0:nSegmentSteps
-                qArmSample = path(segmentIndex,:) + ...
-                    (sampleIndex/nSegmentSteps)*jointDelta;
-                qFullSample = [qArmSample,qReference(8:9)];
-                if any(qArmSample < jointLimits(:,1).'-1e-10 | ...
-                       qArmSample > jointLimits(:,2).'+1e-10) || ...
-                   collision.checkRobotCollision( ...
-                       robot,qFullSample,episode.obstacle,skipPairs)
-                    collisionFree = false;
-                    break;
-                end
-            end
-            if ~collisionFree
-                break;
-            end
-        end
-
-        plannedSteps(caseIndex) = totalSteps;
-        if ~collisionFree
-            outcome(caseIndex) = "invalid: collision or joint limit";
-        elseif totalSteps > cfg.maxSteps
-            outcome(caseIndex) = "unverified: exceeds step limit";
-        else
-            outcome(caseIndex) = "validated route";
-        end
-    end
-
-    clear planningRngGuard; % Restore caller RNG regardless of RRT results.
-    fprintf("\n=== Offline Route Feasibility (Test Only) ===\n");
-    fprintf("Blocked scenarios sampled: %d/%d\n", ...
-        numel(selectedEpisodes),numel(blockedEpisodes));
-    fprintf("Validated alternative routes: %d/%d\n", ...
-        nnz(outcome=="validated route"),numel(selectedEpisodes));
-    fprintf("Planner found no route: %d | too long: %d | invalid: %d\n", ...
-        nnz(outcome=="unverified: planner failed"), ...
-        nnz(outcome=="unverified: exceeds step limit"), ...
-        nnz(outcome=="invalid: collision or joint limit"));
-    for caseIndex = 1:numel(selectedEpisodes)
-        fprintf("  Episode %d: %s | steps: %g | search: %.1f s\n", ...
-            selectedEpisodes(caseIndex),outcome(caseIndex), ...
-            plannedSteps(caseIndex),planningTimes(caseIndex));
-    end
-    fprintf("NOTE: A planner failure is inconclusive. Validated routes are\n");
-    fprintf("discrete certificates for the sampled goal configuration only.\n");
-end
-
 %% 6. Two-pane interactive inspection, using the SAME episodes as report
 if doVisualize
     available = find(isfinite(distances));  % includes obstacle-placement failures
@@ -418,31 +316,6 @@ if doVisualize
             "sphereY",sphereY,"sphereZ",sphereZ);
         selection.Callback = @(src,~) renderSelectedScenario(viewData,src.Value);
         renderSelectedScenario(viewData,1);
-    end
-end
-
-%% Offline planning utility (only for diagnostics, never RL)
-function planningRobot = fixedGripperPlanningRobot(robot,referenceQ)
-    planningRobot = copy(robot);
-    for name = ["panda_leftfinger","panda_rightfinger"]
-        body = getBody(robot,char(name));
-        joint = rigidBodyJoint(body.Joint.Name,"fixed");
-        % Preserve the exact finger-to-parent transform at its fixed opening.
-        fixedTransform = getTransform( ...
-            robot,referenceQ,char(name),body.Parent.Name);
-        setFixedTransform(joint,fixedTransform);
-        replaceJoint(planningRobot,char(name),joint);
-    end
-
-    assert(numel(homeConfiguration(planningRobot))==7, ...
-        "Planning robot must have exactly seven movable joints.");
-    % Verify the altered robot preserves the original grasp geometry.
-    for name = ["panda_leftfinger","panda_rightfinger"]
-        originalTransform = getTransform(robot,referenceQ,char(name));
-        copiedTransform = getTransform( ...
-            planningRobot,referenceQ(1:7),char(name));
-        assert(norm(originalTransform-copiedTransform,"fro")<1e-9, ...
-            "The fixed-gripper planning model changed finger geometry.");
     end
 end
 
