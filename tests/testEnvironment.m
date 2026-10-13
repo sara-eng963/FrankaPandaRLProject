@@ -252,8 +252,12 @@ function renderSelectedScenario(data,selection)
         end
     end
     finishAxes(ax,data.workspace,true);
+    if d.success
+        episodeLabel = "accepted";
+    else
+        episodeLabel = "failed: " + d.failureStage;
+    end
     title(ax,sprintf("Episode %d | %s | %.1f cm | %d candidates", ...
-        data.indices(selection),char(string(d.failureStage)+ ...
-        string(repmat("accepted",1,double(d.success)))), ...
+        data.indices(selection),char(episodeLabel), ...
         100*norm(b-a),n),"Color","w");
 end
