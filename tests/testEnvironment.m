@@ -177,3 +177,178 @@ if acceptedCount > 0
 end
 fprintf("Elapsed wall-clock time: %.2f s\n", elapsed);
 disp("PASS: Obstacle rejection diagnostics match the production reset.");
+
+%% Visual Scenario Dashboard
+% Visualize multiple accepted sampled scenarios in the TA workspace.
+
+dashboardState = initialState;
+p = dashboardState.params;
+
+% Use the calibrated target-distance sampling.
+halfWidths = deg2rad([10 20 10 15 10 15 10]).';
+qCenter = qReady(:);
+
+p.goalJointRanges = [qCenter - halfWidths, qCenter + halfWidths];
+p.startJointRanges = [qCenter - halfWidths, qCenter + halfWidths];
+
+p.maxResetAttempts = 200;
+p.maxTargetAttempts = 200;
+p.minTargetDistance = 0.12;
+p.maxTargetDistance = 0.20;
+
+% Obstacle placement under investigation.
+p.obstacleFractionRange = [0.4, 0.6];
+p.obstacleOffsetRange = [0.02, 0.08];
+p.maxObstacleAttempts = 100;
+
+% Enforce TA workspace.
+p.workspaceBox = cfg.box;
+
+dashboardState.params = p;
+
+nDesired = 12;
+accepted = 0;
+scenarios = cell(nDesired, 1);
+
+savedRng = rng;
+rng(cfg.trainSeed, "twister");
+
+for k = 1:200
+    try
+        [~, s] = environment.resetFunction(dashboardState);
+        accepted = accepted + 1;
+        scenarios{accepted} = s;
+
+        if accepted >= nDesired
+            break;
+        end
+    catch
+        % Skip failed reset attempts in the dashboard sampler.
+    end
+end
+
+rng(savedRng);
+
+assert(accepted > 0, "No valid scenarios available for dashboard visualization.");
+
+scenarios = scenarios(1:accepted);
+
+%% Create figure
+figure("Name", "Environment Visual Dashboard");
+ax = axes;
+hold(ax, "on");
+
+% Show robot in the nominal ready configuration for reference.
+show(robot, qReference, ...
+    "Visuals", "on", ...
+    "Collisions", "off", ...
+    "Frames", "off", ...
+    "Parent", ax);
+
+%% Draw workspace box
+boxLimits = cfg.box;
+
+xmin = boxLimits(1,1); xmax = boxLimits(1,2);
+ymin = boxLimits(2,1); ymax = boxLimits(2,2);
+zmin = boxLimits(3,1); zmax = boxLimits(3,2);
+
+vertices = [
+    xmin ymin zmin
+    xmax ymin zmin
+    xmax ymax zmin
+    xmin ymax zmin
+    xmin ymin zmax
+    xmax ymin zmax
+    xmax ymax zmax
+    xmin ymax zmax
+];
+
+faces = [
+    1 2 3 4
+    5 6 7 8
+    1 2 6 5
+    2 3 7 6
+    3 4 8 7
+    4 1 5 8
+];
+
+patch("Parent", ax, ...
+    "Vertices", vertices, ...
+    "Faces", faces, ...
+    "FaceColor", [0.1 0.7 1.0], ...
+    "FaceAlpha", 0.06, ...
+    "EdgeColor", [0.0 0.5 0.9], ...
+    "LineWidth", 1.2);
+
+%% Plot sampled scenarios
+[Xs, Ys, Zs] = sphere(20);
+
+allDistances = zeros(accepted,1);
+allClearances = zeros(accepted,1);
+
+for i = 1:accepted
+    s = scenarios{i};
+
+    p0 = s.pEE;
+    pg = s.target;
+    center = s.obstacle.Pose(1:3,4);
+    radius = s.obstacle.Radius;
+
+    % Start and goal
+    scatter3(ax, p0(1), p0(2), p0(3), 45, ...
+        "g", "filled");
+    scatter3(ax, pg(1), pg(2), pg(3), 45, ...
+        "r", "filled");
+
+    % Reference line
+    plot3(ax, [p0(1) pg(1)], ...
+              [p0(2) pg(2)], ...
+              [p0(3) pg(3)], ...
+              "-", ...
+              "Color", [0.85 0.2 0.2 0.6], ...
+              "LineWidth", 1.8);
+
+    % Sphere obstacle
+    surf(ax, ...
+        radius*Xs + center(1), ...
+        radius*Ys + center(2), ...
+        radius*Zs + center(3), ...
+        "FaceColor", [1.0 0.55 0.1], ...
+        "FaceAlpha", 0.18, ...
+        "EdgeColor", "none");
+
+    % Distance and straight-line clearance
+    d = pg - p0;
+    alpha = dot(center - p0, d) / dot(d, d);
+    alpha = max(0, min(1, alpha));
+    closest = p0 + alpha*d;
+    clearance = norm(center - closest) - radius;
+
+    allDistances(i) = norm(pg - p0);
+    allClearances(i) = clearance;
+end
+
+%% Final formatting
+axis(ax, "equal");
+grid(ax, "on");
+xlabel(ax, "X (m)");
+ylabel(ax, "Y (m)");
+zlabel(ax, "Z (m)");
+view(ax, 135, 25);
+
+title(ax, sprintf( ...
+    "Sampled Start-Goal Scenarios (%d accepted)", accepted));
+
+xlim(ax, [-0.25 0.85]);
+ylim(ax, [-0.65 0.65]);
+zlim(ax, [0 1.0]);
+
+fprintf("\n=== Visual Dashboard Summary ===\n");
+fprintf("Accepted scenarios displayed: %d\n", accepted);
+fprintf("Distance range [m]: %.3f to %.3f\n", ...
+    min(allDistances), max(allDistances));
+fprintf("Median distance [m]: %.3f\n", median(allDistances));
+fprintf("Clearance range [m]: %.3f to %.3f\n", ...
+    min(allClearances), max(allClearances));
+fprintf("Median straight-line clearance [m]: %.3f\n", ...
+    median(allClearances));
