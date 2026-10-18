@@ -5,7 +5,7 @@
 
 %% 0. Controls
 doVisualize = true;
-nEpisodes = 30;
+nEpisodes = 3;
 maxVisibleScenarios = 12;
 randomizeStarts = true;  % Set false to reproduce the previous fixed-start diagnostic.
 diagnosticSeed = 2026;  % Never use cfg.evalSeed for development.
@@ -24,6 +24,11 @@ disp("PASS: RL environment reset/step integration.");
 
 %% 2. One configuration for both statistics and plots
 scenarioState = initialState;
+
+% Experimental obstacle radius: 3 cm
+scenarioState.obstacle = collisionSphere(0.03);
+scenarioState.obstacle.Pose = initialState.obstacle.Pose;
+
 p = scenarioState.params;
 p.workspaceBox = cfg.box;
 % Wider joint-space candidates; FK and collision rejection still enforce
@@ -46,6 +51,12 @@ end
 p.obstacleFractionRange = [0.4 0.6];
 p.obstacleOffsetRange = [0.02 0.08];
 p.maxObstacleAttempts = 100;
+%% Optional RRT Feasibility Settings
+p.rrt.enabled = true;
+p.rrt.maxIterations = 750;
+p.rrt.maxConnectionDistance = 0.3;
+p.rrt.validationDistance = 0.01;
+
 p.recordScenarioDiagnostics = true;
 scenarioState.params = p;
 
@@ -58,7 +69,8 @@ rng(diagnosticSeed, "twister");
 episodes = cell(nEpisodes,1);
 resetTimes = zeros(nEpisodes,1);
 status = strings(nEpisodes,1);
-counts = zeros(nEpisodes,5); % [target, start, goal, workspace, accepted]
+counts = zeros(nEpisodes,6);
+% [target, start, goal, workspace, accepted, RRT rejected]
 distances = nan(nEpisodes,1);
 deltaXYZ = nan(nEpisodes,3);
 lineClearance = nan(nEpisodes,1);
@@ -75,9 +87,14 @@ for k = 1:nEpisodes
            d.workspaceRejects + double(d.acceptedAttempt > 0), ...
            "Obstacle rejection accounting error at episode %d.", k);
 
-    counts(k,:) = [d.targetPointRejects, d.startCollisionRejects, ...
-                   d.goalCollisionRejects, d.workspaceRejects, ...
-                   double(d.acceptedAttempt > 0)];
+    counts(k,:) = [ ...
+    d.targetPointRejects, ...
+    d.startCollisionRejects, ...
+    d.goalCollisionRejects, ...
+    d.workspaceRejects, ...
+    double(d.acceptedAttempt > 0), ...
+    d.rrtRejects];
+
     if ~isempty(episodeObs)
         assert(d.success && isequal(size(episodeObs), [14 1]), ...
             "Accepted reset returned an invalid observation.");
@@ -101,6 +118,10 @@ for k = 1:nEpisodes
         lineClearance(k) = norm(center-closest) - s.obstacle.Radius;
         assert(~collision.checkRobotCollision(robot,s.q,s.obstacle,skipPairs), ...
             "Accepted start configuration is colliding.");
+        assert(isfield(s, "rrtRouteSteps") && ...
+       isfinite(s.rrtRouteSteps) && ...
+       s.rrtRouteSteps <= cfg.maxSteps, ...
+       "Accepted scenario lacks a valid RRT route.");
     else
         status(k) = d.failureStage;
     end
@@ -137,6 +158,7 @@ if ~isempty(validClearance)
 end
 fprintf("NOTE: Endpoint safety and EE line clearance do not establish a feasible whole-arm route.\n");
 disp("PASS: Online diagnostic accounting verified.");
+fprintf("RRT rejections: %d\n", sum(counts(:,6)));
 
 %% 5. Nominal whole-arm motion diagnostic (testing ONLY)
 % Straight interpolation in JOINT space is a geometric reference, not

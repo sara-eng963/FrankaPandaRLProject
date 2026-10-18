@@ -33,7 +33,7 @@ envParams.reward.failure = 10;
 %% 3. Diagnostic Scenario
 
 % Distant obstacle isolates environment-interface behavior.
-obstacle = collisionSphere(0.05);
+obstacle = collisionSphere(0.03);
 obstacle.Pose = trvec2tform([3, 3, 3]);
 
 initialState.robot = robot;

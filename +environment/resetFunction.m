@@ -12,6 +12,7 @@ function [InitialObs, LoggedSignals] = resetFunction(initialState)
     randomizeTarget = isfield(p, "goalJointRanges");
     randomizeObstacle = isfield(p, "obstacleFractionRange");
     useWorkspaceBox = isfield(p, "workspaceBox");
+    useRRT = isfield(p, "rrt") && p.rrt.enabled;
 
     % Optional diagnostics are strictly opt-in. Standard RL resets retain
     % their original exception behavior and observation layout.
@@ -28,6 +29,7 @@ function [InitialObs, LoggedSignals] = resetFunction(initialState)
             "goalCollisionRejects", 0, ...
             "acceptedAttempt", 0, ...
             "candidateCenters", zeros(0,3), ...
+            "rrtRejects", 0, ...
             "candidateCodes", zeros(0,1,"uint8"));
     end
 
@@ -352,13 +354,50 @@ end
                 continue;
             end
 
-            LoggedSignals.obstacle = candidate;
-            if recordDiagnostics
-                diag.candidateCodes(attempt) = 4;
-                diag.acceptedAttempt = attempt;
-            end
-            accepted = true;
-            break;
+            
+%% RRT Feasibility Validation
+
+if useRRT
+
+    assert(randomizeTarget, ...
+        "RRT validation requires a sampled goal configuration.");
+
+    [feasible, routeSteps] = ...
+        environment.checkScenarioFeasibility( ...
+            LoggedSignals.robot, ...
+            q, ...
+            LoggedSignals.sampledGoalQ, ...
+            candidate, ...
+            p.skipPairs, ...
+            p.maxIncrement, ...
+            p.maxSteps, ...
+            p.rrt);
+
+    if ~feasible
+        if recordDiagnostics
+            diag.rrtRejects = diag.rrtRejects + 1;
+            diag.candidateCodes(attempt) = 6;
+        end
+        continue;
+    end
+
+    % Diagnostic information only.
+    % The RL observation does not contain the planned path.
+    LoggedSignals.rrtRouteSteps = routeSteps;
+end
+
+%% Accept Validated Scenario
+
+LoggedSignals.obstacle = candidate;
+
+if recordDiagnostics
+    diag.candidateCodes(attempt) = 4;
+    diag.acceptedAttempt = attempt;
+end
+
+accepted = true;
+break;
+
         end
 
         if recordDiagnostics
