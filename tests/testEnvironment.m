@@ -1,11 +1,11 @@
-%% Franka Panda — Environment Integration & Scenario Diagnostics
+0%% Franka Panda — Environment Integration & Scenario Diagnostics
 % Real online resets only: no duplicate obstacle collision replay.
 % The current ranges are experimental, NOT official tuned task parameters.
 % Run: run("tests/testEnvironment.m")
 
 %% 0. Controls
-doVisualize = true;
-nEpisodes = 3;
+doVisualize = false;
+nEpisodes = 30;
 maxVisibleScenarios = 12;
 randomizeStarts = true;  % Set false to reproduce the previous fixed-start diagnostic.
 diagnosticSeed = 2026;  % Never use cfg.evalSeed for development.
@@ -30,6 +30,7 @@ scenarioState.obstacle = collisionSphere(0.03);
 scenarioState.obstacle.Pose = initialState.obstacle.Pose;
 
 p = scenarioState.params;
+p.obstacleRadiusRange = [0.03 0.06];  % Radius [m]
 p.workspaceBox = cfg.box;
 % Wider joint-space candidates; FK and collision rejection still enforce
 % reachable start/goal positions inside the unchanged TA workspace.
@@ -67,6 +68,7 @@ rngGuard = onCleanup(@() rng(previousRng));
 rng(diagnosticSeed, "twister");
 
 episodes = cell(nEpisodes,1);
+radii = nan(nEpisodes,1);
 resetTimes = zeros(nEpisodes,1);
 status = strings(nEpisodes,1);
 counts = zeros(nEpisodes,6);
@@ -84,7 +86,8 @@ for k = 1:nEpisodes
 
     assert(d.attempts == d.targetPointRejects + ...
            d.startCollisionRejects + d.goalCollisionRejects + ...
-           d.workspaceRejects + double(d.acceptedAttempt > 0), ...
+           d.workspaceRejects + d.rrtRejects + ...
+           double(d.acceptedAttempt > 0), ...
            "Obstacle rejection accounting error at episode %d.", k);
 
     counts(k,:) = [ ...
@@ -111,7 +114,30 @@ for k = 1:nEpisodes
     end
     if d.success
         status(k) = "accepted";
+
+% Verify randomized sphere radius and observation consistency.
+radii(k) = s.obstacle.Radius;
+
+assert(radii(k) >= p.obstacleRadiusRange(1) && ...
+       radii(k) <= p.obstacleRadiusRange(2), ...
+       "Obstacle radius outside configured range.");
+
+assert(abs(episodeObs(14) - radii(k)) < 1e-12, ...
+       "Observation radius does not match actual obstacle.");
+
+% Verify accepted scenario was validated by RRT.
+assert(isfield(s, "rrtRouteSteps") && ...
+       s.rrtRouteSteps > 0 && ...
+       s.rrtRouteSteps <= cfg.maxSteps, ...
+       "Accepted scenario lacks a valid RRT route.");
+
         center = s.obstacle.Pose(1:3,4);
+        radius = s.obstacle.Radius;
+        assert(all(center-radius >= cfg.box(:,1)-1e-10) && ...
+               all(center+radius <= cfg.box(:,2)+1e-10), ...
+            "Sphere extends outside the workspace.");
+        assert(~collision.checkRobotCollision(robot,s.sampledGoalQ,s.obstacle,skipPairs), ...
+            "Accepted goal configuration is colliding.");
         segment = s.target - s.pEE;
         fraction = max(0,min(1,dot(center-s.pEE,segment)/dot(segment,segment)));
         closest = s.pEE + fraction*segment;
@@ -159,6 +185,23 @@ end
 fprintf("NOTE: Endpoint safety and EE line clearance do not establish a feasible whole-arm route.\n");
 disp("PASS: Online diagnostic accounting verified.");
 fprintf("RRT rejections: %d\n", sum(counts(:,6)));
+
+
+%% Randomized obstacle radius report
+validRadii = radii(isfinite(radii));
+
+if ~isempty(validRadii)
+    fprintf("\n=== Sphere Radius Diagnostics ===\n");
+    fprintf("Configured radius range: %.1f - %.1f cm\n", ...
+        100*p.obstacleRadiusRange);
+
+    fprintf("Accepted radius range: %.2f - %.2f cm\n", ...
+        100*min(validRadii), 100*max(validRadii));
+
+    fprintf("Mean accepted radius: %.2f cm\n", ...
+        100*mean(validRadii));
+end
+
 
 %% 5. Nominal whole-arm motion diagnostic (testing ONLY)
 % Straight interpolation in JOINT space is a geometric reference, not

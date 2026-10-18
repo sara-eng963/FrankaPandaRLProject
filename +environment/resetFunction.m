@@ -270,11 +270,29 @@ end
                maxAttempts == floor(maxAttempts), ...
                "Invalid obstacle attempt limit.");
 
-        obstacleRadius = LoggedSignals.obstacle.Radius;
+       
+%% Sample obstacle radius once per episode
+% If no radius range is provided, preserve fixed-radius behavior.
+
+obstacleRadius = LoggedSignals.obstacle.Radius;
+
+if isfield(p, "obstacleRadiusRange")
+    radiusRange = p.obstacleRadiusRange;
+
+    assert(isnumeric(radiusRange) && ...
+           isequal(size(radiusRange), [1, 2]) && ...
+           all(isfinite(radiusRange)) && ...
+           radiusRange(1) > 0 && ...
+           radiusRange(1) < radiusRange(2), ...
+           "Invalid obstacle radius range.");
+
+    obstacleRadius = radiusRange(1) + ...
+        rand * (radiusRange(2) - radiusRange(1));
+end
 
         if recordDiagnostics
             % Codes: 1=target overlap, 2=start robot, 3=goal robot,
-            % 4=accepted, 5=outside workspace.
+            % 4=accepted, 5=outside workspace, 6=RRT.
             diag.candidateCenters = zeros(maxAttempts, 3);
             diag.candidateCodes = zeros(maxAttempts, 1, "uint8");
         end
@@ -297,33 +315,88 @@ end
         lateral1 = lateral1 / norm(lateral1);
         lateral2 = cross(direction, lateral1);
 
+% Radius-aware bounds for sphere centers.
+% The entire sphere must remain inside the workspace.
+if useWorkspaceBox
+    centerMin = workspaceBox(:,1) + obstacleRadius;
+    centerMax = workspaceBox(:,2) - obstacleRadius;
+
+    assert(all(centerMin <= centerMax), ...
+        "Sphere is too large to fit inside the workspace.");
+end
+
+
         accepted = false;
 
-        for attempt = 1:maxAttempts
-            alpha = fractionRange(1) + rand * diff(fractionRange);
-            rho = offsetRange(1) + rand * diff(offsetRange);
-            theta = 2*pi*rand;
 
-            center = pStart + alpha*segment + ...
-                rho*(cos(theta)*lateral1 + sin(theta)*lateral2);
+for attempt = 1:maxAttempts
+    if recordDiagnostics
+        diag.attempts = attempt;
+    end
 
-            if recordDiagnostics
-                diag.attempts = attempt;
-                diag.candidateCenters(attempt,:) = center.';
-            end
+    % 1. Random position along the start-target segment.
+    alpha = fractionRange(1) + rand * diff(fractionRange);
+    theta = 2*pi*rand;
 
-            % Keep the entire sphere inside the specified workspace.
-            % No workspaceBox means unrestricted diagnostic geometry.
-            if useWorkspaceBox && any( ...
-                    center - obstacleRadius < workspaceBox(:,1) | ...
-                    center + obstacleRadius > workspaceBox(:,2))
-                if recordDiagnostics
-                    diag.workspaceRejects = diag.workspaceRejects + 1;
-                    diag.candidateCodes(attempt) = 5;
+    anchor = pStart + alpha*segment;
+
+    % Random perpendicular direction.
+    lateralDir = cos(theta)*lateral1 + sin(theta)*lateral2;
+
+    % 2. Start with the configured lateral-offset range.
+    rhoMin = offsetRange(1);
+    rhoMax = offsetRange(2);
+
+    % 3. Restrict the offset using the valid center bounds.
+    if useWorkspaceBox
+        for axis = 1:3
+
+            if abs(lateralDir(axis)) < 1e-12
+                % No movement along this coordinate.
+                if anchor(axis) < centerMin(axis) || ...
+                   anchor(axis) > centerMax(axis)
+                    rhoMin = Inf;
+                    break;
                 end
-                continue;
-            end
+            else
+                % Allowed lateral offsets along this axis.
+                limits = ([centerMin(axis), centerMax(axis)] ...
+                          - anchor(axis)) / lateralDir(axis);
 
+                rhoMin = max(rhoMin, min(limits));
+                rhoMax = min(rhoMax, max(limits));
+            end
+        end
+
+        % This direction has no valid lateral offset.
+        if rhoMin > rhoMax
+            if recordDiagnostics
+                diag.workspaceRejects = ...
+                    diag.workspaceRejects + 1;
+                diag.candidateCodes(attempt) = 5;
+
+                % Record a nominal rejected point for plotting.
+                diag.candidateCenters(attempt,:) = ...
+                    (anchor + offsetRange(1)*lateralDir).';
+            end
+            continue;
+        end
+    end
+
+    % 4. Sample only from the admissible offset interval.
+    rho = rhoMin + rand*(rhoMax - rhoMin);
+    center = anchor + rho*lateralDir;
+
+    if recordDiagnostics
+        diag.candidateCenters(attempt,:) = center.';
+    end
+
+    % Defensive validation: every constructed sphere must fit.
+    if useWorkspaceBox && any( ...
+            center - obstacleRadius < workspaceBox(:,1) - 1e-12 | ...
+            center + obstacleRadius > workspaceBox(:,2) + 1e-12)
+        error("Radius-aware sampler produced an invalid center.");
+    end
             candidate = collisionSphere(obstacleRadius);
             candidate.Pose = trvec2tform(center.');
 
