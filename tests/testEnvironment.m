@@ -164,6 +164,7 @@ fprintf('Direct interpolation: blocked=%d, self-blocked=%d, over horizon=%d.\n',
     nnz(nominalBlocked(ok)),nnz(selfBlocked(ok)),nnz(nominalSteps(ok)>cfg.maxSteps));
 disp('RRT validates discrete full-arm routes; continuous swept clearance is not established.');
 if doVisualize
+    showOverview(starts(ok,:),goals(ok,:),cfg.box,nEpisodes);
     showInspector(episodes,find(ok),robot,cfg.box,maxVisibleScenarios);
 end
 assert(isequal(rngBefore,rng));
@@ -277,17 +278,43 @@ function [blocked,selfBlocked,nSteps] = inspectInterpolation(s)
     end
 end
 
+function showOverview(starts,goals,workspace,nAttempted)
+    % Show every accepted episode in one workspace, independent of the
+    % inspector's maxVisibleScenarios cap.
+    fig=figure('Name','Panda accepted scenarios overview', ...
+        'NumberTitle','off','Color',[0.10 0.12 0.16], ...
+        'Position',[80 100 1050 700]);
+    ax=axes('Parent',fig,'Position',[0.08 0.11 0.78 0.79]);
+    hold(ax,'on');
+    drawWorkspaceBox(ax,workspace);
+    hStart=scatter3(ax,starts(:,1),starts(:,2),starts(:,3), ...
+        55,[0.24 0.82 0.58],'filled');
+    hGoal=scatter3(ax,goals(:,1),goals(:,2),goals(:,3), ...
+        55,[0.99 0.36 0.43],'filled');
+    finishAxes(ax);
+    % Unlike the inspector, show the entire task box at useful scale.
+    margin=0.035;
+    xlim(ax,workspace(1,:)+[-margin margin]);
+    ylim(ax,workspace(2,:)+[-margin margin]);
+    zlim(ax,workspace(3,:)+[-margin margin]);
+    title(ax,sprintf('Accepted scenarios: %d/%d',size(goals,1),nAttempted), ...
+        'Color','w');
+    legend(ax,[hStart hGoal],{'Start','Goal'}, ...
+        'Location','northeastoutside','TextColor','w', ...
+        'Color',[0.10 0.12 0.16]);
+end
+
 function showInspector(episodes,available,robot,workspace,maxVisible)
     if isempty(available), return; end
     available=available(1:min(maxVisible,numel(available)));
     fig=figure('Name','Panda accepted scenario inspection', ...
         'NumberTitle','off','Color',[0.10 0.12 0.16],'Position',[100 100 1350 660]);
-    ax=axes('Parent',fig,'Position',[0.06 0.10 0.88 0.82]);
+    ax=axes('Parent',fig,'Position',[0.06 0.09 0.88 0.77]);
     [sx,sy,sz]=feval('sphere',16);
     data=struct('axes',ax,'figure',fig,'episodes',{episodes},'indices',available, ...
         'robot',robot,'workspace',workspace,'sphereX',sx,'sphereY',sy,'sphereZ',sz);
     selection=uicontrol(fig,'Style','popupmenu','Units','normalized', ...
-        'Position',[0.58 0.94 0.33 0.045],'String',cellstr("Episode "+string(available)));
+        'Position',[0.78 0.93 0.18 0.045],'String',cellstr("Episode "+string(available)));
     selection.Callback=@(src,~) renderSelectedScenario(data,src.Value);
     renderSelectedScenario(data,1);
 end
