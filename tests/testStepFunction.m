@@ -386,17 +386,19 @@ disp("PASS: Reset sampling exhaustion handled correctly.");
 %% Test 14: Randomized Target Generation
 % Verify target diversity, distance constraints,
 % and reproducibility.
-% Ranges are diagnostic, NOT course parameters.
+% Workspace and solver limits are diagnostic configuration.
 
 targetState = randomState;
 
-% Create diagnostic goal sampling ranges
-qCenter = state.q(1:7).';
-goalDelta = deg2rad(0.1) * ones(7,1);
-goalDelta(1) = deg2rad(12);
-
-targetState.params.goalJointRanges = ...
-    [qCenter - goalDelta, qCenter + goalDelta];
+% Position-only IK is configured once and shared by randomized reset tests.
+targetState.params.workspaceBox = cfg.box;
+targetState.params.ikSolver = inverseKinematics('RigidBodyTree',robot, ...
+    'SolverAlgorithm','LevenbergMarquardt');
+targetState.params.ikSolver.SolverParameters = struct('MaxIterations',100, ...
+    'MaxTime',1,'SolutionTolerance',1e-6,'EnforceJointLimits',true, ...
+    'AllowRandomRestart',false);
+targetState.params.ikMaxInitialGuesses = 3;
+targetState.params.ikPositionTolerance = 0.001;
 
 targetState.params.maxTargetAttempts = 100;
 targetState.params.minTargetDistance = 0.03;
@@ -488,7 +490,7 @@ disp("PASS: Randomized obstacle placement is valid and reproducible.");
 
 %% Test 16: Batch Randomized Reset Validation
 % Test reset reliability and measure execution time.
-% Uses diagnostic sampling ranges, not course parameters.
+% Uses diagnostic sampling settings, not course parameters.
 
 nEpisodes = 30;
 
@@ -546,12 +548,13 @@ staleState = state;
 % Deliberately provide an incorrect cached position
 staleState.pEE = [100; 100; 100];
 
-% Sample goals extremely close to the actual start pose
-qCenter = state.q(1:7).';
-delta = deg2rad(0.01);
-
-staleState.params.goalJointRanges = ...
-    [qCenter - delta, qCenter + delta];
+% Every Cartesian candidate in this tiny test box is too close to the true start.
+TTrue = kinematics.forwardKinematics(robot,state.q,eeFrame);
+pTrue = TTrue(1:3,4);
+staleState.params.workspaceBox = [pTrue-1e-5 pTrue+1e-5];
+staleState.params.ikSolver = targetState.params.ikSolver;
+staleState.params.ikMaxInitialGuesses = 3;
+staleState.params.ikPositionTolerance = 0.001;
 
 staleState.params.maxTargetAttempts = 5;
 staleState.params.minTargetDistance = 0.03;
@@ -705,11 +708,13 @@ catch ME
 end
 assert(rejected, "Out-of-bounds randomized start accepted.");
 
-% B. Randomized targets must reject out-of-bounds samples.
+% B. An impossible distance shell exhausts bounded Cartesian proposals.
 invalidGoal = workspaceState;
-invalidGoal.params.goalJointRanges = outsideRanges;
+invalidGoal.params.ikSolver = targetState.params.ikSolver;
+invalidGoal.params.ikMaxInitialGuesses = 3;
+invalidGoal.params.ikPositionTolerance = 0.001;
 invalidGoal.params.maxTargetAttempts = 5;
-invalidGoal.params.minTargetDistance = 0.03;
+invalidGoal.params.minTargetDistance = 2;
 
 rejected = false;
 try
@@ -718,7 +723,7 @@ catch ME
     rejected = contains(ME.message, ...
         "no valid target within attempt limit");
 end
-assert(rejected, "Out-of-bounds randomized target accepted.");
+assert(rejected, "Infeasible distance-shell target accepted.");
 
 % C. Verify successful sampling from an admissible region.
 validState = workspaceState;
@@ -728,10 +733,9 @@ startDelta = 5e-4;
 validState.params.startJointRanges = ...
     [qCenter-startDelta, qCenter+startDelta];
 
-goalRanges = [qCenter-startDelta, qCenter+startDelta];
-goalRanges(1,:) = [0.12, 0.15];
-
-validState.params.goalJointRanges = goalRanges;
+validState.params.ikSolver = targetState.params.ikSolver;
+validState.params.ikMaxInitialGuesses = 3;
+validState.params.ikPositionTolerance = 0.001;
 validState.params.maxResetAttempts = 50;
 validState.params.maxTargetAttempts = 50;
 validState.params.minTargetDistance = 0.03;
@@ -771,7 +775,8 @@ assert(isequal(regularObs, diagnosticObs) && ...
 diag = diagnosticReset.scenarioDiagnostics;
 assert(diag.success && diag.acceptedAttempt >= 1 && ...
        diag.attempts == diag.targetPointRejects + ...
-       diag.startCollisionRejects + diag.goalCollisionRejects + 1 && ...
+       diag.startCollisionRejects + diag.goalCollisionRejects + ...
+       diag.workspaceRejects + diag.rrtRejects + 1 && ...
        numel(diag.candidateCodes) == diag.attempts, ...
        "Opt-in reset diagnostic accounting failed.");
 assert(~isfield(regularReset,"scenarioDiagnostics"), ...

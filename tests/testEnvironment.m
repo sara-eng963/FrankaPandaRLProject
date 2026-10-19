@@ -1,387 +1,295 @@
-0%% Franka Panda — Environment Integration & Scenario Diagnostics
-% Real online resets only: no duplicate obstacle collision replay.
-% The current ranges are experimental, NOT official tuned task parameters.
-% Run: run("tests/testEnvironment.m")
-
-%% 0. Controls
-doVisualize = false;
-nEpisodes = 30;
-maxVisibleScenarios = 12;
-randomizeStarts = true;  % Set false to reproduce the previous fixed-start diagnostic.
-diagnosticSeed = 2026;  % Never use cfg.evalSeed for development.
-
-%% 1. RL Toolbox integration
-projectRoot = fileparts(fileparts(mfilename("fullpath")));
-addpath(projectRoot);
-run(fullfile(projectRoot, "Scripts", "create_rl_environment.m"));
-
-obs = reset(env);
-[nextObs, reward, done, info] = step(env, zeros(7,1));
-assert(isequal(size(obs), [14 1]) && ...
-       isequal(size(nextObs), [14 1]) && isfinite(reward) && ...
-       ~done && info.stepCount == 1, "RL Toolbox integration failed.");
-disp("PASS: RL environment reset/step integration.");
-
-%% 2. One configuration for both statistics and plots
-scenarioState = initialState;
-
-% Experimental obstacle radius: 3 cm
-scenarioState.obstacle = collisionSphere(0.03);
-scenarioState.obstacle.Pose = initialState.obstacle.Pose;
-
-p = scenarioState.params;
-p.obstacleRadiusRange = [0.03 0.06];  % Radius [m]
-p.workspaceBox = cfg.box;
-% Wider joint-space candidates; FK and collision rejection still enforce
-% reachable start/goal positions inside the unchanged TA workspace.
-halfWidths = deg2rad([30 40 30 30 30 35 40]).';
-qCenter = qReady(:);
-jointRanges = [max(qCenter-halfWidths, jointLimits(:,1)), ...
-               min(qCenter+halfWidths, jointLimits(:,2))];
-assert(all(jointRanges(:,1) < jointRanges(:,2)), ...
-    "Invalid calibrated joint-sampling interval.");
-p.goalJointRanges = jointRanges;
-p.maxTargetAttempts = 200;
-p.minTargetDistance = 0.20;
-p.maxTargetDistance = 0.30;
-
-if randomizeStarts
-    p.startJointRanges = p.goalJointRanges;
-    p.maxResetAttempts = 200;
+%% Franka Panda: online scenario diagnostic and regression checks
+% Override controls before run, e.g. environmentDiagnosticOptions = struct( ...
+%   'nEpisodes',3,'doVisualize',false,'startRangeMultiplier',1, ...
+%   'targetDistanceRange',[0.15 0.40],'seed',2026);
+if ~exist('environmentDiagnosticOptions','var')
+    environmentDiagnosticOptions = struct();
 end
+controls = environmentDiagnosticOptions;
+nEpisodes = option(controls,'nEpisodes',30);
+doVisualize = option(controls,'doVisualize',true);
+maxVisibleScenarios = option(controls,'maxVisibleScenarios',30);
+diagnosticSeed = option(controls,'seed',2026);
+halfWidthsDegrees = option(controls,'halfWidthsDegrees',[30 40 30 30 30 35 40]);
+startRangeMultiplier = option(controls,'startRangeMultiplier',1);
+targetDistanceRange = option(controls,'targetDistanceRange',[0.15 0.40]);
+ikMaxInitialGuesses = option(controls,'ikMaxInitialGuesses',3);
+ikMaxIterations = option(controls,'ikMaxIterations',100);
+ikMaxTime = option(controls,'ikMaxTime',1);
+ikPositionTolerance = option(controls,'ikPositionTolerance',0.001);
+ikSolutionTolerance = option(controls,'ikSolutionTolerance',1e-6);
+validateattributes(nEpisodes,{'double'},{'scalar','integer','positive'});
+validateattributes(maxVisibleScenarios,{'double'},{'scalar','integer','positive'});
+validateattributes(diagnosticSeed,{'double'}, ...
+    {'scalar','integer','nonnegative','<=',2^32-nEpisodes});
+validateattributes(halfWidthsDegrees,{'double'},{'size',[1 7],'finite','positive'});
+validateattributes(startRangeMultiplier,{'double'},{'scalar','finite','positive'});
+validateattributes(ikMaxInitialGuesses,{'double'},{'scalar','integer','positive'});
+validateattributes(ikMaxIterations,{'double'},{'scalar','integer','positive'});
+validateattributes(ikMaxTime,{'double'},{'scalar','finite','positive'});
+validateattributes(targetDistanceRange,{'double'},{'size',[1 2],'nonnan'});
+projectRoot = fileparts(fileparts(mfilename('fullpath')));
+addpath(projectRoot);
+run(fullfile(projectRoot,'Scripts','create_rl_environment.m'));
+obs = reset(env);
+[nextObs,reward,done,info] = step(env,zeros(7,1));
+assert(isequal(size(obs),[14 1]) && isequal(size(nextObs),[14 1]) && ...
+    isfinite(reward) && ~done && info.stepCount==1);
+assert(cfg.maxSteps==400 && cfg.maxIncrement==0.01);
+assert(isfinite(targetDistanceRange(1)) && targetDistanceRange(1)>cfg.posTol && ...
+    targetDistanceRange(2)>targetDistanceRange(1),'Invalid target-distance limits.');
+disp('PASS: RL reset/step interface.');
+
+%% Original joint-space starts; Cartesian-first goals with a reusable solver.
+halfWidths = deg2rad(halfWidthsDegrees).';
+startWidths = startRangeMultiplier*halfWidths;
+p = initialState.params;
+p.startJointRanges = [max(qReady(:)-startWidths,jointLimits(:,1)), ...
+                     min(qReady(:)+startWidths,jointLimits(:,2))];
+p.workspaceBox = cfg.box;
+p.maxResetAttempts = 200;
+p.maxTargetAttempts = option(controls,'maxTargetAttempts',200);
+p.ikSolver = createIKSolver(robot,ikMaxIterations,ikMaxTime,ikSolutionTolerance);
+p.ikMaxInitialGuesses = ikMaxInitialGuesses;
+p.ikPositionTolerance = ikPositionTolerance;
+p.minTargetDistance = targetDistanceRange(1);
+% Infinite upper distance means no upper-distance restriction in reset.
+if isfinite(targetDistanceRange(2))
+    p.maxTargetDistance = targetDistanceRange(2);
+end
+p.obstacleRadiusRange = [0.03 0.06];
 p.obstacleFractionRange = [0.4 0.6];
 p.obstacleOffsetRange = [0.02 0.08];
 p.maxObstacleAttempts = 100;
-%% Optional RRT Feasibility Settings
-p.rrt.enabled = true;
-p.rrt.maxIterations = 750;
-p.rrt.maxConnectionDistance = 0.3;
-p.rrt.validationDistance = 0.01;
-
+p.rrt = struct('enabled',true,'maxIterations',750, ...
+    'maxConnectionDistance',0.3,'validationDistance',0.01);
 p.recordScenarioDiagnostics = true;
+scenarioState = initialState;
 scenarioState.params = p;
 
-%% 3. Instrumented production resets (no replay)
-% RNG restoration is exception-safe, including assertion failures.
-previousRng = rng;
-rngGuard = onCleanup(@() rng(previousRng));
-rng(diagnosticSeed, "twister");
-
+%% Generate each scenario online. Retain outputs for inspection only.
+rngBefore = rng;
 episodes = cell(nEpisodes,1);
-radii = nan(nEpisodes,1);
-resetTimes = zeros(nEpisodes,1);
+observations = cell(nEpisodes,1);
 status = strings(nEpisodes,1);
-counts = zeros(nEpisodes,6);
-% [target, start, goal, workspace, accepted, RRT rejected]
+resetSeconds = zeros(nEpisodes,1);
+targetAttempts = zeros(nEpisodes,1);
+targetSeconds = zeros(nEpisodes,1);
+ikCalls = zeros(nEpisodes,1); ikFailures = ikCalls; ikTimeLimits = ikCalls;
+goals = nan(nEpisodes,3); starts = nan(nEpisodes,3);
+counts = zeros(nEpisodes,7);
+routeSteps = nan(nEpisodes,1);
+radii = nan(nEpisodes,1);
 distances = nan(nEpisodes,1);
-deltaXYZ = nan(nEpisodes,3);
-lineClearance = nan(nEpisodes,1);
-
+nominalBlocked = false(nEpisodes,1);
+selfBlocked = false(nEpisodes,1);
+nominalSteps = nan(nEpisodes,1);
 for k = 1:nEpisodes
-    timer = tic;
-    [episodeObs, s] = environment.resetFunction(scenarioState);
-    resetTimes(k) = toc(timer);
+    fprintf('Reset %d/%d ...\n',k,nEpisodes);
+    [episodeObs,s,resetSeconds(k)] = runReset(scenarioState,diagnosticSeed+k-1);
+    verifyReset(episodeObs,s,cfg);
     d = s.scenarioDiagnostics;
-    episodes{k} = s;
-
-    assert(d.attempts == d.targetPointRejects + ...
-           d.startCollisionRejects + d.goalCollisionRejects + ...
-           d.workspaceRejects + d.rrtRejects + ...
-           double(d.acceptedAttempt > 0), ...
-           "Obstacle rejection accounting error at episode %d.", k);
-
-    counts(k,:) = [ ...
-    d.targetPointRejects, ...
-    d.startCollisionRejects, ...
-    d.goalCollisionRejects, ...
-    d.workspaceRejects, ...
-    double(d.acceptedAttempt > 0), ...
-    d.rrtRejects];
-
-    if ~isempty(episodeObs)
-        assert(d.success && isequal(size(episodeObs), [14 1]), ...
-            "Accepted reset returned an invalid observation.");
-    else
-        assert(~d.success && strlength(d.failureStage) > 0, ...
-            "Failed diagnostic reset lacks a failure stage.");
-    end
-    % Start/target data is meaningful only after both endpoints were
-    % sampled; an early failure may still contain initialState placeholders.
-    if (d.success || d.failureStage == "obstacle") && ...
-            all(isfinite(s.pEE)) && all(isfinite(s.target))
-        deltaXYZ(k,:) = (s.target - s.pEE).';
-        distances(k) = norm(s.target - s.pEE);
-    end
+    episodes{k} = s; observations{k} = episodeObs;
+    targetAttempts(k) = d.targetAttempts; targetSeconds(k) = d.targetSeconds;
+    ikCalls(k)=d.ikCalls; ikFailures(k)=d.ikFailures; ikTimeLimits(k)=d.ikTimeLimits;
+    starts(k,:)=s.pEE.';
+    counts(k,:) = [d.targetPointRejects d.startCollisionRejects ...
+        d.goalCollisionRejects d.workspaceRejects double(d.success) ...
+        d.rrtRejects d.rrtAttempts-d.rrtRejects];
     if d.success
         status(k) = "accepted";
-
-% Verify randomized sphere radius and observation consistency.
-radii(k) = s.obstacle.Radius;
-
-assert(radii(k) >= p.obstacleRadiusRange(1) && ...
-       radii(k) <= p.obstacleRadiusRange(2), ...
-       "Obstacle radius outside configured range.");
-
-assert(abs(episodeObs(14) - radii(k)) < 1e-12, ...
-       "Observation radius does not match actual obstacle.");
-
-% Verify accepted scenario was validated by RRT.
-assert(isfield(s, "rrtRouteSteps") && ...
-       s.rrtRouteSteps > 0 && ...
-       s.rrtRouteSteps <= cfg.maxSteps, ...
-       "Accepted scenario lacks a valid RRT route.");
-
-        center = s.obstacle.Pose(1:3,4);
-        radius = s.obstacle.Radius;
-        assert(all(center-radius >= cfg.box(:,1)-1e-10) && ...
-               all(center+radius <= cfg.box(:,2)+1e-10), ...
-            "Sphere extends outside the workspace.");
-        assert(~collision.checkRobotCollision(robot,s.sampledGoalQ,s.obstacle,skipPairs), ...
-            "Accepted goal configuration is colliding.");
-        segment = s.target - s.pEE;
-        fraction = max(0,min(1,dot(center-s.pEE,segment)/dot(segment,segment)));
-        closest = s.pEE + fraction*segment;
-        lineClearance(k) = norm(center-closest) - s.obstacle.Radius;
-        assert(~collision.checkRobotCollision(robot,s.q,s.obstacle,skipPairs), ...
-            "Accepted start configuration is colliding.");
-        assert(isfield(s, "rrtRouteSteps") && ...
-       isfinite(s.rrtRouteSteps) && ...
-       s.rrtRouteSteps <= cfg.maxSteps, ...
-       "Accepted scenario lacks a valid RRT route.");
+        goals(k,:)=s.target.';
+        radii(k) = s.obstacle.Radius;
+        distances(k) = norm(s.target-s.pEE);
+        routeSteps(k) = s.rrtRouteSteps;
+        [nominalBlocked(k),selfBlocked(k),nominalSteps(k)] = inspectInterpolation(s);
     else
         status(k) = d.failureStage;
     end
+    fprintf('  %s; %.2f s; target draws %d; RRT rejected/attempted %d/%d.\n', ...
+        status(k),resetSeconds(k),d.targetAttempts,d.rrtRejects,d.rrtAttempts);
 end
-
-clear rngGuard; % restores the caller's RNG state
-
-%% 4. Numerical report
-nAccepted = nnz(status == "accepted");
-fprintf("\n=== Online Obstacle-Placement Diagnostics ===\n");
-fprintf("Start sampling: %s | Episodes: %d\n", ...
-    string(randomizeStarts), nEpisodes);
-fprintf("Accepted: %d/%d | Failed: %d\n", nAccepted,nEpisodes,nEpisodes-nAccepted);
-fprintf("Failures: start=%d target=%d obstacle=%d\n", ...
-    nnz(status=="start"),nnz(status=="target"),nnz(status=="obstacle"));
-fprintf("Sphere candidates: %d\n",sum(counts,"all"));
-fprintf("Rejected target/start/goal/workspace: %d / %d / %d / %d\n", ...
-    sum(counts(:,1)),sum(counts(:,2)),sum(counts(:,3)),sum(counts(:,4)));
-fprintf("Accepted sphere candidates: %d\n",sum(counts(:,5)));
-fprintf("Reset time: median %.1f ms | max %.1f ms\n", ...
-    median(resetTimes)*1000,max(resetTimes)*1000);
-validDistance = distances(isfinite(distances));
-if ~isempty(validDistance)
-    fprintf("Endpoint separation: median %.1f cm | range %.1f–%.1f cm\n", ...
-        100*median(validDistance),100*min(validDistance),100*max(validDistance));
-    fprintf("Median displacement XYZ [cm]: [%.1f %.1f %.1f]\n", ...
-        100*median(deltaXYZ(isfinite(distances),:),1));
+% Replay one accepted scenario (or the first failure if all calls failed).
+% This tests the same real reset, including RRT, without maintaining a pool.
+replay = find(status=="accepted",1);
+if isempty(replay), replay=1; end
+[replayObs,replayState] = runReset(scenarioState,diagnosticSeed+replay-1);
+a = episodes{replay}; b = replayState;
+assert(isequal(observations{replay},replayObs) && isequal(a.q,b.q) && ...
+    isequal(a.target,b.target) && isequal(a.obstacle.Pose,b.obstacle.Pose) && ...
+    a.obstacle.Radius==b.obstacle.Radius,'Seeded reset is not reproducible.');
+timers = {'startSeconds','targetSeconds','rrtSeconds'};
+assert(isequaln(rmfield(a.scenarioDiagnostics,timers), ...
+    rmfield(b.scenarioDiagnostics,timers)));
+if a.scenarioDiagnostics.success
+    assert(a.rrtRouteSteps==b.rrtRouteSteps);
 end
-validClearance = lineClearance(isfinite(lineClearance));
-if ~isempty(validClearance)
-    fprintf("Accepted EE line obstructed: %d/%d\n", ...
-        nnz(validClearance<=0),numel(validClearance));
-    fprintf("Median accepted line clearance: %.1f cm\n",100*median(validClearance));
+assert(isequal(rngBefore,rng),'Diagnostic changed the caller RNG.');
+
+%% Concise scenario report, including exhaustion rather than hiding failures.
+ok = status=="accepted"; nAccepted = nnz(ok);
+summary = table(nEpisodes,nAccepted,nnz(status=="start"),nnz(status=="target"), ...
+    nnz(status=="obstacle"),mean(resetSeconds(ok)), ...
+    sum(resetSeconds)/nAccepted,mean(targetAttempts),1000*mean(targetSeconds), ...
+    sum(counts(:,6)),mean(routeSteps(ok)), ...
+    max([NaN;routeSteps(ok)],[],'omitnan'),100*mean(nominalBlocked(ok)), ...
+    'VariableNames',{'Attempted','Accepted','StartFailed','TargetFailed', ...
+    'ObstacleFailed','MeanSuccessfulReset_s','TotalSecondsPerSuccess', ...
+    'MeanTargetAttempts','MeanTarget_ms','RRTRejected','MeanRouteSteps', ...
+    'MaxRouteSteps','DirectBlockedPercent'});
+% Observed endpoint cells, not proof of full-cell or workspace reachability.
+gridSize=[10 10 10]; points=goals(ok,:);
+indices=min(floor((points-cfg.box(:,1).')./ ...
+    (diff(cfg.box,1,2).'./gridSize))+1,gridSize);
+ids=sub2ind(gridSize,indices(:,1),indices(:,2),indices(:,3));
+occupancyCounts=reshape(accumarray(ids,ones(nAccepted,1),[prod(gridSize) 1]),gridSize);
+summary.IKCalls=sum(ikCalls); summary.IKFailures=sum(ikFailures);
+summary.IKTimeLimits=sum(ikTimeLimits);
+summary.OccupiedPercent=100*nnz(occupancyCounts)/prod(gridSize);
+obstacleSummary = array2table(sum(counts,1),'VariableNames', ...
+    {'TargetOverlap','StartCollision','GoalCollision','Workspace','Accepted', ...
+    'RRTRejected','RRTAccepted'});
+disp(summary); disp(obstacleSummary);
+fprintf('Start half-width multiplier %.2f; position-only IK tolerance %.4g m.\n', ...
+    startRangeMultiplier,ikPositionTolerance);
+if nAccepted>0
+    fprintf('Accepted distance [min mean max] m: %.4f %.4f %.4f\n', ...
+        min(distances(ok)),mean(distances(ok)),max(distances(ok)));
+    fprintf('Accepted radius [min mean max] m: %.4f %.4f %.4f\n', ...
+        min(radii(ok)),mean(radii(ok)),max(radii(ok)));
+    fprintf('Accepted XYZ min [m]: %.4f %.4f %.4f; max: %.4f %.4f %.4f\n', ...
+        min(points,[],1),max(points,[],1));
 end
-fprintf("NOTE: Endpoint safety and EE line clearance do not establish a feasible whole-arm route.\n");
-disp("PASS: Online diagnostic accounting verified.");
-fprintf("RRT rejections: %d\n", sum(counts(:,6)));
-
-
-%% Randomized obstacle radius report
-validRadii = radii(isfinite(radii));
-
-if ~isempty(validRadii)
-    fprintf("\n=== Sphere Radius Diagnostics ===\n");
-    fprintf("Configured radius range: %.1f - %.1f cm\n", ...
-        100*p.obstacleRadiusRange);
-
-    fprintf("Accepted radius range: %.2f - %.2f cm\n", ...
-        100*min(validRadii), 100*max(validRadii));
-
-    fprintf("Mean accepted radius: %.2f cm\n", ...
-        100*mean(validRadii));
-end
-
-
-%% 5. Nominal whole-arm motion diagnostic (testing ONLY)
-% Straight interpolation in JOINT space is a geometric reference, not
-% an RL action, demonstration, Cartesian EE path, or motion planner.
-% Sample increments are at most the course's 0.01 rad per joint.
-acceptedEpisodes = find(status == "accepted");
-nominalBlocked = false(nEpisodes,1);
-nominalSelfCollision = false(nEpisodes,1);
-nominalObstacleOnly = false(nEpisodes,1);
-nominalSteps = nan(nEpisodes,1);
-
-for episodeIndex = acceptedEpisodes.'
-    episode = episodes{episodeIndex};
-    assert(isfield(episode,"sampledGoalQ"), ...
-        "Accepted randomized episode lacks its sampled goal configuration.");
-
-    qStart = episode.q;
-    qGoal = episode.sampledGoalQ;
-    assert(isequal(size(qStart),[1 9]) && isequal(size(qGoal),[1 9]), ...
-        "Invalid start or goal configuration at episode %d.",episodeIndex);
-
-    dq = qGoal(1:7) - qStart(1:7);
-    nSteps = max(1,ceil(max(abs(dq))/episode.params.maxIncrement));
-    nominalSteps(episodeIndex) = nSteps;
-
-    for sampleIndex = 1:nSteps
-        qSample = qStart;
-        qSample(1:7) = qStart(1:7) + (sampleIndex/nSteps)*dq;
-
-        if collision.checkRobotCollision(episode.robot,qSample, ...
-                episode.obstacle,episode.params.skipPairs)
-            nominalBlocked(episodeIndex) = true;
-            % A self-collision at this sample may coexist with an
-            % obstacle collision; only a self-free sample establishes
-            % that the obstacle alone obstructs this nominal motion.
-            nominalSelfCollision(episodeIndex) = checkCollision( ...
-                episode.robot,qSample, ...
-                "SkippedSelfCollisions",episode.params.skipPairs);
-            nominalObstacleOnly(episodeIndex) = ...
-                ~nominalSelfCollision(episodeIndex);
-            break;
-        end
-    end
-end
-
-nBlocked = nnz(nominalBlocked(acceptedEpisodes));
-nObstacleOnly = nnz(nominalObstacleOnly(acceptedEpisodes));
-nSelfCollision = nnz(nominalSelfCollision(acceptedEpisodes));
-nDirectClear = numel(acceptedEpisodes)-nBlocked;
-nExceedsHorizon = nnz(nominalSteps(acceptedEpisodes)>cfg.maxSteps);
-nDirectFeasible = nnz(~nominalBlocked(acceptedEpisodes) & ...
-    nominalSteps(acceptedEpisodes)<=cfg.maxSteps);
-
-fprintf("\n=== Whole-Arm Nominal Motion Diagnostic ===\n");
-fprintf("Accepted scenarios tested: %d\n",numel(acceptedEpisodes));
-fprintf("Direct joint-space interpolation blocked: %d/%d\n", ...
-    nBlocked,numel(acceptedEpisodes));
-fprintf("First collision: obstacle-only=%d | self (possibly both)=%d\n", ...
-    nObstacleOnly,nSelfCollision);
-fprintf("Collision-free at sampled configurations: %d/%d\n", ...
-    nDirectClear,numel(acceptedEpisodes));
-fprintf("Direct interpolation exceeds %d-step horizon: %d\n", ...
-    cfg.maxSteps,nExceedsHorizon);
-fprintf("Sampled collision-free and within horizon: %d/%d\n", ...
-    nDirectFeasible,numel(acceptedEpisodes));
-fprintf("NOTE: Discrete checks (<=%.3f rad/joint per sample) do not prove\n", ...
-    cfg.maxIncrement);
-fprintf("continuous swept-path clearance or existence of another route.\n");
-disp("PASS: Whole-arm nominal motion diagnostic completed.");
-
-%% 5A. Obstacle-free reference check (TEST ONLY)
-% Use the same joint-space samples. Never provide this reference to RL.
-% A trajectory collision-free WITH the sphere must also be self-free
-% without it, so only recheck cases blocked in the original test.
-obstacleFreeSelfBlocked = false(nEpisodes,1);
-
-for episodeIndex = acceptedEpisodes.'
-    if ~nominalBlocked(episodeIndex)
-        continue; % Existing full-arm check covered every sample.
-    end
-    if nominalSelfCollision(episodeIndex)
-        obstacleFreeSelfBlocked(episodeIndex) = true;
-        continue; % Self-collision was already detected.
-    end
-
-    episode = episodes{episodeIndex};
-    qStart = episode.q;
-    dq = episode.sampledGoalQ(1:7) - qStart(1:7);
-    nSteps = nominalSteps(episodeIndex);
-
-    for sampleIndex = 1:nSteps
-        qSample = qStart;
-        qSample(1:7) = qStart(1:7) + (sampleIndex/nSteps)*dq;
-
-        if any(checkCollision(episode.robot,qSample, ...
-                "SkippedSelfCollisions",episode.params.skipPairs))
-            obstacleFreeSelfBlocked(episodeIndex) = true;
-            break;
-        end
-    end
-end
-
-withSphereBlocked = nominalBlocked(acceptedEpisodes);
-withoutSphereBlocked = obstacleFreeSelfBlocked(acceptedEpisodes);
-blockedOnlyWithSphere = nnz(withSphereBlocked & ~withoutSphereBlocked);
-blockedBothWays = nnz(withSphereBlocked & withoutSphereBlocked);
-clearBothWays = nnz(~withSphereBlocked & ~withoutSphereBlocked);
-
-assert(~any(~withSphereBlocked & withoutSphereBlocked), ...
-    "Obstacle-free reference contradicts whole-arm collision checks.");
-assert(blockedOnlyWithSphere + blockedBothWays + clearBothWays == ...
-       numel(acceptedEpisodes), "Reference-motion accounting mismatch.");
-
-fprintf("\n=== Obstacle-Free Whole-Arm Reference ===\n");
-fprintf("Accepted scenarios compared: %d\n",numel(acceptedEpisodes));
-fprintf("Self-colliding without sphere: %d/%d\n", ...
-    nnz(withoutSphereBlocked),numel(acceptedEpisodes));
-fprintf("Clear without sphere, blocked with sphere: %d/%d\n", ...
-    blockedOnlyWithSphere,numel(acceptedEpisodes));
-fprintf("Blocked with and without sphere: %d/%d\n", ...
-    blockedBothWays,numel(acceptedEpisodes));
-fprintf("Clear with and without sphere: %d/%d\n", ...
-    clearBothWays,numel(acceptedEpisodes));
-fprintf("NOTE: Discrete checks do not prove continuous swept-path\n");
-fprintf("clearance or a feasible alternative route.\n");
-disp("PASS: Obstacle-free reference comparison completed.");
-
-%% 6. Two-pane interactive inspection, using the SAME episodes as report
+fprintf('Direct interpolation: blocked=%d, self-blocked=%d, over horizon=%d.\n', ...
+    nnz(nominalBlocked(ok)),nnz(selfBlocked(ok)),nnz(nominalSteps(ok)>cfg.maxSteps));
+disp('RRT validates discrete full-arm routes; continuous swept clearance is not established.');
 if doVisualize
-    available = find(isfinite(distances));  % includes obstacle-placement failures
-    if isempty(available)
-        warning("No valid endpoint pairs to visualize.");
-    else
-        available = available(1:min(maxVisibleScenarios,numel(available)));
-        fig = figure("Name","Panda | Scenario Diagnostics", ...
-            "NumberTitle","off","Color",[0.10 0.12 0.16], ...
-            "Position",[100 100 1350 660]);
-        overviewAx = axes("Parent",fig,"Position",[0.05 0.13 0.40 0.76]);
-        detailAx = axes("Parent",fig,"Position",[0.54 0.13 0.41 0.76]);
+    showInspector(episodes,find(ok),robot,cfg.box,maxVisibleScenarios);
+end
+assert(isequal(rngBefore,rng));
+disp('PASS: FK, workspace, radii, collision safety, route constraints, accounting and reproducibility.');
 
-        hold(overviewAx,"on");
-        drawWorkspaceBox(overviewAx,cfg.box);
-        % Call the function explicitly: testStepFunction.m leaves a
-        % collisionSphere variable named "sphere" in the base workspace.
-        [sphereX,sphereY,sphereZ] = feval("sphere",16);
+function value = option(s,name,default)
+    if isfield(s,name), value=s.(name); else, value=default; end
+end
 
-        for j = 1:numel(available)
-            ep = episodes{available(j)};
-            startPos = ep.pEE;
-            goalPos = ep.target;
-            plot3(overviewAx,[startPos(1) goalPos(1)], ...
-                [startPos(2) goalPos(2)],[startPos(3) goalPos(3)], ...
-                "-","Color",[0.47 0.68 0.92],"LineWidth",1.4);
-            scatter3(overviewAx,startPos(1),startPos(2),startPos(3), ...
-                32,[0.24 0.82 0.58],"filled");
-            scatter3(overviewAx,goalPos(1),goalPos(2),goalPos(3), ...
-                32,[0.99 0.36 0.43],"filled");
-            if ep.scenarioDiagnostics.success
-                c = ep.obstacle.Pose(1:3,4);
-                r = ep.obstacle.Radius;
-                surf(overviewAx,r*sphereX+c(1),r*sphereY+c(2), ...
-                    r*sphereZ+c(3),"EdgeColor","none", ...
-                    "FaceColor",[0.99 0.65 0.25],"FaceAlpha",0.22);
+function solver = createIKSolver(robot,maxIterations,maxTime,solutionTolerance)
+    % MATLAB solver construction also uses randomness. Isolate that setup;
+    % target sampling itself uses each reset's existing private stream.
+    caller = RandStream.getGlobalStream;
+    guard = onCleanup(@() RandStream.setGlobalStream(caller));
+    RandStream.setGlobalStream(RandStream('mt19937ar','Seed',0));
+    solver = inverseKinematics('RigidBodyTree',robot,'SolverAlgorithm','LevenbergMarquardt');
+    solver.SolverParameters = struct('MaxIterations',maxIterations, ...
+        'MaxTime',maxTime,'SolutionTolerance',solutionTolerance, ...
+        'EnforceJointLimits',true,'AllowRandomRestart',false);
+end
+
+function [obs,s,elapsed] = runReset(state,seed)
+    callerStream = RandStream.getGlobalStream;
+    guard = onCleanup(@() RandStream.setGlobalStream(callerStream));
+    RandStream.setGlobalStream(RandStream('mt19937ar','Seed',seed));
+    timer = tic;
+    [obs,s] = environment.resetFunction(state);
+    elapsed = toc(timer);
+end
+
+function verifyReset(obs,s,cfg)
+    p=s.params; d=s.scenarioDiagnostics;
+    assert(d.attempts==d.targetPointRejects+d.startCollisionRejects+ ...
+        d.goalCollisionRejects+d.workspaceRejects+d.rrtRejects+double(d.success));
+    startPassed = d.failureStage~="start";
+    targetPassed = startPassed && d.failureStage~="target";
+    assert(d.startAttempts==d.startSampleCollisionRejects+ ...
+        d.startSampleWorkspaceRejects+double(startPassed));
+    assert(d.targetAttempts==d.targetIKRejects+d.targetDistanceRejects+double(targetPassed));
+    assert(d.ikCalls==d.ikFailures+double(targetPassed));
+    assert(d.ikCalls<=p.maxTargetAttempts*p.ikMaxInitialGuesses);
+    assert(d.rrtAttempts==d.rrtRejects+double(d.success));
+    assert(d.startAttempts<=p.maxResetAttempts && d.targetAttempts<=p.maxTargetAttempts);
+    assert(d.attempts<=p.maxObstacleAttempts);
+    assert(numel(d.candidateCodes)==d.attempts);
+    for code=[1 2 3 4 5 6]
+        expected = [d.targetPointRejects d.startCollisionRejects d.goalCollisionRejects ...
+            double(d.success) d.workspaceRejects d.rrtRejects];
+        assert(nnz(d.candidateCodes==code)==expected(code));
+    end
+    if ~d.success
+        assert(isempty(obs) && ismember(d.failureStage,["start","target","obstacle"]));
+        return;
+    end
+    assert(isequal(size(obs),[14 1]) && all(isfinite(obs)));
+    assert(all(s.pEE>=cfg.box(:,1) & s.pEE<=cfg.box(:,2)));
+    assert(all(s.target>=cfg.box(:,1) & s.target<=cfg.box(:,2)));
+    assert(norm(obs(1:7)-s.q(1:7).')<1e-12);
+    assert(norm(obs(8:10)-(s.target-s.pEE))<1e-12);
+    center=s.obstacle.Pose(1:3,4); radius=s.obstacle.Radius;
+    assert(norm(obs(11:13)-center)<1e-12 && abs(obs(14)-radius)<1e-12);
+    assert(radius>=p.obstacleRadiusRange(1) && ...
+        radius<=p.obstacleRadiusRange(2) && radius==d.obstacleRadius);
+    assert(all(center-radius>=cfg.box(:,1)-1e-10) && ...
+        all(center+radius<=cfg.box(:,2)+1e-10));
+    distance=norm(s.target-s.pEE);
+    assert(distance>=p.minTargetDistance);
+    if isfield(p,'maxTargetDistance'), assert(distance<=p.maxTargetDistance); end
+    qStart=s.q; qGoal=s.sampledGoalQ;
+    for i=1:2
+        if i==1, q=qStart; ranges=p.startJointRanges; xyz=s.pEE;
+        else, q=qGoal; ranges=p.jointLimits; xyz=s.target; end
+        assert(all(q(1:7)>=ranges(:,1).' & q(1:7)<=ranges(:,2).'));
+        assert(all(q(1:7)>=p.jointLimits(:,1).' & q(1:7)<=p.jointLimits(:,2).'));
+        assert(isequal(q(8:9),[0.04 0.04]));
+        T=kinematics.forwardKinematics(s.robot,q,s.eeFrame);
+        if i==1
+            assert(norm(T(1:3,4)-xyz)<1e-10);
+        else
+            assert(norm(T(1:3,4)-xyz)<=p.ikPositionTolerance);
+            assert(all(T(1:3,4)>=cfg.box(:,1) & T(1:3,4)<=cfg.box(:,2)));
+            actualDistance=norm(T(1:3,4)-s.pEE);
+            assert(actualDistance>=p.minTargetDistance);
+            if isfield(p,'maxTargetDistance'), assert(actualDistance<=p.maxTargetDistance); end
+        end
+        assert(~collision.checkRobotCollision(s.robot,q,s.obstacle,p.skipPairs));
+    end
+    assert(isfinite(s.rrtRouteSteps) && s.rrtRouteSteps>0 && ...
+        s.rrtRouteSteps<=cfg.maxSteps && s.rrtRouteSteps==floor(s.rrtRouteSteps));
+end
+
+function [blocked,selfBlocked,nSteps] = inspectInterpolation(s)
+    q=s.q; dq=s.sampledGoalQ(1:7)-q(1:7);
+    nSteps=max(1,ceil(max(abs(dq))/s.params.maxIncrement));
+    assert(max(abs(dq/nSteps))<=s.params.maxIncrement+1e-12);
+    blocked=false; selfBlocked=false;
+    for j=1:nSteps
+        qSample=q; qSample(1:7)=q(1:7)+(j/nSteps)*dq;
+        if collision.checkRobotCollision(s.robot,qSample,s.obstacle,s.params.skipPairs)
+            blocked=true; break;
+        end
+    end
+    % Preserve the prior obstacle-free reference on blocked interpolations.
+    if blocked
+        for j=1:nSteps
+            qSample=q; qSample(1:7)=q(1:7)+(j/nSteps)*dq;
+            if checkCollision(s.robot,qSample,'SkippedSelfCollisions',s.params.skipPairs)
+                selfBlocked=true; break;
             end
         end
-        finishAxes(overviewAx,cfg.box,false);
-        title(overviewAx,sprintf("Workspace | %d sampled pairs",numel(available)), ...
-            "Color","w");
-
-        selection = uicontrol(fig,"Style","popupmenu", ...
-            "Units","normalized","Position",[0.58 0.94 0.33 0.045], ...
-            "String",cellstr("Episode "+string(available)), ...
-            "BackgroundColor",[0.96 0.96 0.96]);
-        viewData = struct("axes",detailAx,"figure",fig, ...
-            "episodes",{episodes},"indices",available,"robot",robot, ...
-            "workspace",cfg.box,"sphereX",sphereX, ...
-            "sphereY",sphereY,"sphereZ",sphereZ);
-        selection.Callback = @(src,~) renderSelectedScenario(viewData,src.Value);
-        renderSelectedScenario(viewData,1);
     end
+end
+
+function showInspector(episodes,available,robot,workspace,maxVisible)
+    if isempty(available), return; end
+    available=available(1:min(maxVisible,numel(available)));
+    fig=figure('Name','Panda accepted scenario inspection', ...
+        'NumberTitle','off','Color',[0.10 0.12 0.16],'Position',[100 100 1350 660]);
+    ax=axes('Parent',fig,'Position',[0.06 0.10 0.88 0.82]);
+    [sx,sy,sz]=feval('sphere',16);
+    data=struct('axes',ax,'figure',fig,'episodes',{episodes},'indices',available, ...
+        'robot',robot,'workspace',workspace,'sphereX',sx,'sphereY',sy,'sphereZ',sz);
+    selection=uicontrol(fig,'Style','popupmenu','Units','normalized', ...
+        'Position',[0.58 0.94 0.33 0.045],'String',cellstr("Episode "+string(available)));
+    selection.Callback=@(src,~) renderSelectedScenario(data,src.Value);
+    renderSelectedScenario(data,1);
 end
 
 %% Local visualization routines (not called by the RL environment)
@@ -393,25 +301,18 @@ function drawWorkspaceBox(ax,limits)
     f=[1 2 3 4;5 6 7 8;1 2 6 5;2 3 7 6;3 4 8 7;4 1 5 8];
     patch(ax,"Vertices",v,"Faces",f, ...
         "FaceColor",[0.08 0.67 0.88],"FaceAlpha",0.07, ...
-        "EdgeColor",[0.16 0.77 0.98],"LineWidth",1.3);
+        "EdgeColor",[0.16 0.77 0.98],"LineWidth",1.3,"HandleVisibility","off");
 end
 
-function finishAxes(ax,limits,showRobot)
+function finishAxes(ax)
     axis(ax,"equal");
     view(ax,130,23);
     grid(ax,"on"); box(ax,"on");
     xlabel(ax,"X (m)");ylabel(ax,"Y (m)");zlabel(ax,"Z (m)");
     ax.Color=[0.10 0.12 0.16]; ax.XColor=[0.88 0.90 0.94];
     ax.YColor=ax.XColor;ax.ZColor=ax.XColor;
-    if ~showRobot
-        pad=0.06;
-        xlim(ax,limits(1,:)+[-pad pad]);
-        ylim(ax,limits(2,:)+[-pad pad]);
-        zlim(ax,limits(3,:)+[-pad pad]);
-    else
-        % Entire robot + task region; avoid clipping the manipulator.
-        xlim(ax,[-0.35 0.82]); ylim(ax,[-0.55 0.55]); zlim(ax,[0 0.95]);
-    end
+    % Entire robot + task region; avoid clipping the manipulator.
+    xlim(ax,[-0.35 0.82]); ylim(ax,[-0.55 0.55]); zlim(ax,[0 0.95]);
 end
 
 function renderSelectedScenario(data,selection)
@@ -454,7 +355,7 @@ function renderSelectedScenario(data,selection)
             end
         end
     end
-    finishAxes(ax,data.workspace,true);
+    finishAxes(ax);
     if d.success
         episodeLabel = "accepted";
     else

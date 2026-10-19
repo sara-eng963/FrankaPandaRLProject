@@ -2,14 +2,17 @@ function [InitialObs, LoggedSignals] = resetFunction(initialState)
 %RESETFUNCTION Initialize a Panda obstacle-avoidance RL episode.
 % Samples optional start, target and sphere configurations. The Cartesian
 % workspace constrains episode starts and targets, not intermediate motion.
-% No IK or trajectory planning is used during reset.
+% Cartesian goals are validated with position-only IK; RRT validates scenarios.
+% Neither solver supplies actions to the RL agent or runs in stepFunction.
 
     LoggedSignals = initialState;
     p = LoggedSignals.params;
     q = LoggedSignals.q;
 
     randomizeStart = isfield(p, "startJointRanges");
-    randomizeTarget = isfield(p, "goalJointRanges");
+    randomizeTarget = isfield(p, "ikSolver");
+    assert(~isfield(p,"goalJointRanges") || randomizeTarget, ...
+        'goalJointRanges no longer enables goal randomization; configure ikSolver.');
     randomizeObstacle = isfield(p, "obstacleFractionRange");
     useWorkspaceBox = isfield(p, "workspaceBox");
     useRRT = isfield(p, "rrt") && p.rrt.enabled;
@@ -21,6 +24,24 @@ function [InitialObs, LoggedSignals] = resetFunction(initialState)
     if recordDiagnostics
         diag = struct( ...
             "success", false, ...
+            "startAttempts", 0, ...
+            "startSeconds", 0, ...
+            "startSampleCollisionRejects", 0, ...
+            "startSampleWorkspaceRejects", 0, ...
+            "targetIKRejects", 0, ...
+            "ikCalls", 0, ...
+            "ikFailures", 0, ...
+            "ikSolverNonconverged", 0, ...
+            "ikTimeLimits", 0, ...
+            "goalPositionError", NaN, ...
+            "targetAttempts", 0, ...
+            "targetSeconds", 0, ...
+            "targetCollisionRejects", 0, ...
+            "targetWorkspaceRejects", 0, ...
+            "targetDistanceRejects", 0, ...
+            "rrtAttempts", 0, ...
+            "rrtSeconds", 0, ...
+            "obstacleRadius", NaN, ...
             "failureStage", "", ...
             "attempts", 0, ...
             "targetPointRejects", 0, ...
@@ -65,11 +86,17 @@ function [InitialObs, LoggedSignals] = resetFunction(initialState)
                "Invalid maximum reset attempts.");
 
         accepted = false;
+        if recordDiagnostics
+            startTimer = tic;
+        end
 
         for attempt = 1:p.maxResetAttempts
             qCandidate = q;
             qCandidate(1:7) = ranges(:,1).' + ...
                 rand(1,7) .* (ranges(:,2) - ranges(:,1)).';
+            if recordDiagnostics
+                diag.startAttempts = attempt;
+            end
 
             % Ignore the placeholder sphere if reset will replace it.
             if randomizeObstacle
@@ -83,6 +110,9 @@ function [InitialObs, LoggedSignals] = resetFunction(initialState)
             end
 
             if isColliding
+                if recordDiagnostics
+                    diag.startSampleCollisionRejects = diag.startSampleCollisionRejects+1;
+                end
                 continue;
             end
 
@@ -94,6 +124,9 @@ function [InitialObs, LoggedSignals] = resetFunction(initialState)
             if useWorkspaceBox && ...
                any(pCandidate < workspaceBox(:,1) | ...
                    pCandidate > workspaceBox(:,2))
+                if recordDiagnostics
+                    diag.startSampleWorkspaceRejects = diag.startSampleWorkspaceRejects+1;
+                end
                 continue;
             end
 
@@ -101,6 +134,10 @@ function [InitialObs, LoggedSignals] = resetFunction(initialState)
             pStart = pCandidate;
             accepted = true;
             break;
+        end
+
+        if recordDiagnostics
+            diag.startSeconds = toc(startTimer);
         end
 
         if ~accepted
@@ -144,87 +181,32 @@ function [InitialObs, LoggedSignals] = resetFunction(initialState)
     LoggedSignals.q = q;
     LoggedSignals.pEE = pStart;
 
-    %% 2. Target Position
+    %% 2. Cartesian target feasibility (solver configured once by caller)
     if randomizeTarget
-        ranges = p.goalJointRanges;
-
-        assert(isequal(size(ranges), [7, 2]) && ...
-               all(isfinite(ranges(:))) && ...
-               all(ranges(:,1) < ranges(:,2)) && ...
-               all(ranges(:,1) >= p.jointLimits(:,1)) && ...
-               all(ranges(:,2) <= p.jointLimits(:,2)), ...
-               "Invalid goal joint ranges.");
-
-        assert(isscalar(p.maxTargetAttempts) && ...
-               isfinite(p.maxTargetAttempts) && ...
-               p.maxTargetAttempts >= 1 && ...
-               p.maxTargetAttempts == floor(p.maxTargetAttempts), ...
-               "Invalid target sampling attempt limit.");
-
-        assert(isscalar(p.minTargetDistance) && ...
-               isfinite(p.minTargetDistance) && ...
-               p.minTargetDistance > p.positionTolerance, ...
-               "Invalid minimum target distance.");
-        % Validate the optional upper distance bound before sampling.
-useMaxDistance = isfield(p, "maxTargetDistance");
-
-if useMaxDistance
-    assert(isscalar(p.maxTargetDistance) && ...
-           isfinite(p.maxTargetDistance) && ...
-           p.maxTargetDistance > p.minTargetDistance, ...
-           "Invalid maximum target distance.");
-end
-
-        accepted = false;
-
-        for attempt = 1:p.maxTargetAttempts
-            qGoal = q;
-            qGoal(1:7) = ranges(:,1).' + ...
-                rand(1,7) .* (ranges(:,2) - ranges(:,1)).';
-
-            if randomizeObstacle
-                isColliding = checkCollision( ...
-                    LoggedSignals.robot, qGoal, ...
-                    "SkippedSelfCollisions", p.skipPairs);
-            else
-                isColliding = collision.checkRobotCollision( ...
-                    LoggedSignals.robot, qGoal, ...
-                    LoggedSignals.obstacle, p.skipPairs);
-            end
-
-            if isColliding
-                continue;
-            end
-
-            % Sample joint space, then map to a reachable Cartesian target.
-            TGoal = kinematics.forwardKinematics( ...
-                LoggedSignals.robot, qGoal, LoggedSignals.eeFrame);
-            targetCandidate = TGoal(1:3,4);
-
-            if useWorkspaceBox && ...
-               any(targetCandidate < workspaceBox(:,1) | ...
-                   targetCandidate > workspaceBox(:,2))
-                continue;
-            end
-
-        % Enforce the calibrated start-to-target distance range.
-        targetDistance = norm(targetCandidate - pStart);
-        
-        if targetDistance < p.minTargetDistance || ...
-                (useMaxDistance && targetDistance > p.maxTargetDistance)
-            continue;
+        assert(useWorkspaceBox,'Cartesian goal sampling requires workspaceBox.');
+        assert(p.minTargetDistance>p.positionTolerance, ...
+            'Minimum target distance must exceed the position tolerance.');
+        if randomizeObstacle
+            [targetCandidate,qGoal,g] = environment.sampleGoalConfiguration( ...
+                LoggedSignals.robot,LoggedSignals.eeFrame,q,p);
+        else
+            [targetCandidate,qGoal,g] = environment.sampleGoalConfiguration( ...
+                LoggedSignals.robot,LoggedSignals.eeFrame,q,p,LoggedSignals.obstacle);
         end
-            LoggedSignals.target = targetCandidate;
-
-            % Retain the sampled goal configuration for environment diagnostics.
-            % It is not included in the agent's observation.
-            LoggedSignals.sampledGoalQ = qGoal;
-            
-            accepted = true;
-            break;
+        if recordDiagnostics
+            diag.targetAttempts = g.targetAttempts;
+            diag.targetSeconds = g.seconds;
+            diag.targetDistanceRejects = g.distanceRejects;
+            diag.targetIKRejects = g.targetIKRejects;
+            diag.targetCollisionRejects = g.collisionRejects;
+            diag.targetWorkspaceRejects = g.workspaceRejects;
+            diag.ikCalls = g.ikCalls;
+            diag.ikFailures = g.ikFailures;
+            diag.ikSolverNonconverged = g.solverNonconverged;
+            diag.ikTimeLimits = g.solverTimeLimits;
+            diag.goalPositionError = g.positionError;
         end
-
-        if ~accepted
+        if ~g.success
             if recordDiagnostics
                 diag.failureStage = "target";
                 LoggedSignals.scenarioDiagnostics = diag;
@@ -233,6 +215,9 @@ end
             end
             error("Reset failed: no valid target within attempt limit.");
         end
+        LoggedSignals.target = targetCandidate;
+        % Feasibility witness only: excluded from the 14D RL observation.
+        LoggedSignals.sampledGoalQ = qGoal;
     end
 
     assert(isequal(size(LoggedSignals.target), [3, 1]) && ...
@@ -288,6 +273,9 @@ if isfield(p, "obstacleRadiusRange")
 
     obstacleRadius = radiusRange(1) + ...
         rand * (radiusRange(2) - radiusRange(1));
+end
+if recordDiagnostics
+    diag.obstacleRadius = obstacleRadius;
 end
 
         if recordDiagnostics
@@ -435,6 +423,10 @@ if useRRT
     assert(randomizeTarget, ...
         "RRT validation requires a sampled goal configuration.");
 
+    if recordDiagnostics
+        diag.rrtAttempts = diag.rrtAttempts+1;
+        rrtTimer = tic;
+    end
     [feasible, routeSteps] = ...
         environment.checkScenarioFeasibility( ...
             LoggedSignals.robot, ...
@@ -445,6 +437,9 @@ if useRRT
             p.maxIncrement, ...
             p.maxSteps, ...
             p.rrt);
+    if recordDiagnostics
+        diag.rrtSeconds = diag.rrtSeconds+toc(rrtTimer);
+    end
 
     if ~feasible
         if recordDiagnostics
