@@ -1,15 +1,18 @@
 %% Franka Panda: online scenario diagnostic and regression checks
 % Override controls before run, e.g. environmentDiagnosticOptions = struct( ...
 %   'nEpisodes',3,'doVisualize',false,'startRangeMultiplier',1, ...
-%   'targetDistanceRange',[0.15 0.40],'seed',2026);
+%   'targetDistanceRange',[0.15 0.50],'seed',314159, ...
+%   'obstacleSamplingMode',"ee_tube",'armSamplingProbability',0.5);
+% Optional: 'armSweepFractions',[0.4 0.5 0.6], 'reportCollisionLinks',true.
 if ~exist('environmentDiagnosticOptions','var')
     environmentDiagnosticOptions = struct();
 end
 controls = environmentDiagnosticOptions;
 nEpisodes = option(controls,'nEpisodes',30);
 doVisualize = option(controls,'doVisualize',true);
+reportCollisionLinks = option(controls,'reportCollisionLinks',false);
 maxVisibleScenarios = option(controls,'maxVisibleScenarios',30);
-diagnosticSeed = option(controls,'seed',2026);
+diagnosticSeed = option(controls,'seed',314159);
 halfWidthsDegrees = option(controls,'halfWidthsDegrees',[30 40 30 30 30 35 40]);
 startRangeMultiplier = option(controls,'startRangeMultiplier',1);
 targetDistanceRange = option(controls,'targetDistanceRange',[0.15 0.50]);
@@ -19,6 +22,7 @@ ikMaxTime = option(controls,'ikMaxTime',1);
 ikPositionTolerance = option(controls,'ikPositionTolerance',0.001);
 ikSolutionTolerance = option(controls,'ikSolutionTolerance',1e-6);
 validateattributes(nEpisodes,{'double'},{'scalar','integer','positive'});
+validateattributes(reportCollisionLinks,{'logical'},{'scalar'});
 validateattributes(maxVisibleScenarios,{'double'},{'scalar','integer','positive'});
 validateattributes(diagnosticSeed,{'double'}, ...
     {'scalar','integer','nonnegative','<=',2^32-nEpisodes});
@@ -31,6 +35,8 @@ validateattributes(targetDistanceRange,{'double'},{'size',[1 2],'nonnan'});
 projectRoot = fileparts(fileparts(mfilename('fullpath')));
 addpath(projectRoot);
 run(fullfile(projectRoot,'Scripts','create_rl_environment.m'));
+assert(cfg.evalSeed<diagnosticSeed || cfg.evalSeed>diagnosticSeed+nEpisodes-1, ...
+    'Diagnostic seed range must exclude the reserved evaluation seed.');
 obs = reset(env);
 [nextObs,reward,done,info] = step(env,zeros(7,1));
 assert(isequal(size(obs),[14 1]) && isequal(size(nextObs),[14 1]) && ...
@@ -60,10 +66,14 @@ end
 p.obstacleRadiusRange = [0.03 0.06];
 p.obstacleFractionRange = [0.4 0.6];
 p.obstacleOffsetRange = [0.02 0.08];
+p.obstacleSamplingMode = option(controls,'obstacleSamplingMode',"ee_tube");
+p.armSamplingProbability = option(controls,'armSamplingProbability',0.5);
+p.armSweepFractions = option(controls,'armSweepFractions',[0.4 0.5 0.6]);
 p.maxObstacleAttempts = 100;
 p.rrt = struct('enabled',true,'maxIterations',750, ...
     'maxConnectionDistance',0.3,'validationDistance',0.01);
 p.recordScenarioDiagnostics = true;
+p.recordObstacleSamplingGeometry = option(controls,'recordObstacleSamplingGeometry',false);
 scenarioState = initialState;
 scenarioState.params = p;
 
@@ -75,6 +85,13 @@ status = strings(nEpisodes,1);
 resetSeconds = zeros(nEpisodes,1);
 targetAttempts = zeros(nEpisodes,1);
 targetSeconds = zeros(nEpisodes,1);
+rrtMeasurements = zeros(nEpisodes,4);
+rrtSeconds = zeros(nEpisodes,1);
+obstacleAttempts = zeros(nEpisodes,1);
+samplingMethods = strings(nEpisodes,1);
+anchorCounts = zeros(nEpisodes,3);
+noFeasibleAnchors = false(nEpisodes,1);
+firstCollisionPairs = strings(nEpisodes,1);
 ikCalls = zeros(nEpisodes,1); ikFailures = ikCalls; ikTimeLimits = ikCalls;
 goals = nan(nEpisodes,3); starts = nan(nEpisodes,3);
 counts = zeros(nEpisodes,7);
@@ -91,6 +108,14 @@ for k = 1:nEpisodes
     d = s.scenarioDiagnostics;
     episodes{k} = s; observations{k} = episodeObs;
     targetAttempts(k) = d.targetAttempts; targetSeconds(k) = d.targetSeconds;
+    rrtMeasurements(k,:) = [d.rrtSetupSeconds d.rrtPlanSeconds ...
+        d.rrtVerifySeconds d.rrtCollisionChecks];
+    rrtSeconds(k) = d.rrtSeconds;
+    obstacleAttempts(k) = d.attempts;
+    samplingMethods(k) = d.obstacleSamplingMode;
+    anchorCounts(k,:) = [d.armAnchorsGenerated d.armAnchorsRejected ...
+        d.armAnchorsRetained];
+    noFeasibleAnchors(k) = d.armNoFeasibleAnchors;
     ikCalls(k)=d.ikCalls; ikFailures(k)=d.ikFailures; ikTimeLimits(k)=d.ikTimeLimits;
     starts(k,:)=s.pEE.';
     counts(k,:) = [d.targetPointRejects d.startCollisionRejects ...
@@ -102,7 +127,8 @@ for k = 1:nEpisodes
         radii(k) = s.obstacle.Radius;
         distances(k) = norm(s.target-s.pEE);
         routeSteps(k) = s.rrtRouteSteps;
-        [nominalBlocked(k),selfBlocked(k),nominalSteps(k)] = inspectInterpolation(s);
+        [nominalBlocked(k),selfBlocked(k),nominalSteps(k), ...
+            firstCollisionPairs(k)] = inspectInterpolation(s,reportCollisionLinks);
     else
         status(k) = d.failureStage;
     end
@@ -118,7 +144,8 @@ a = episodes{replay}; b = replayState;
 assert(isequal(observations{replay},replayObs) && isequal(a.q,b.q) && ...
     isequal(a.target,b.target) && isequal(a.obstacle.Pose,b.obstacle.Pose) && ...
     a.obstacle.Radius==b.obstacle.Radius,'Seeded reset is not reproducible.');
-timers = {'startSeconds','targetSeconds','rrtSeconds'};
+timers = {'startSeconds','targetSeconds','rrtSeconds', ...
+    'rrtSetupSeconds','rrtPlanSeconds','rrtVerifySeconds'};
 assert(isequaln(rmfield(a.scenarioDiagnostics,timers), ...
     rmfield(b.scenarioDiagnostics,timers)));
 if a.scenarioDiagnostics.success
@@ -150,6 +177,50 @@ obstacleSummary = array2table(sum(counts,1),'VariableNames', ...
     {'TargetOverlap','StartCollision','GoalCollision','Workspace','Accepted', ...
     'RRTRejected','RRTAccepted'});
 disp(summary); disp(obstacleSummary);
+% Empty method means start/goal generation failed before method selection.
+% Successful-reset RRT time includes all its candidate feasibility calls.
+methods = unique(samplingMethods);
+samplingSummary = table();
+for methodIndex = 1:numel(methods)
+    selected = samplingMethods==methods(methodIndex);
+    successful = selected & ok;
+    methodLabel = methods(methodIndex);
+    if methodLabel=="", methodLabel="not_selected"; end
+    row = table(methodLabel,nnz(successful),nnz(selected & ~ok), ...
+        mean(obstacleAttempts(successful)), ...
+        sum(counts(selected,1)),sum(counts(selected,2)), ...
+        sum(counts(selected,3)),sum(counts(selected,4)), ...
+        sum(counts(selected,6)),mean(resetSeconds(successful)), ...
+        mean(rrtSeconds(successful)), ...
+        'VariableNames',{'Method','Accepted','Failed','MeanCandidatesPerSuccess', ...
+        'TargetOverlap','StartCollision','GoalCollision','Workspace', ...
+        'RRTRejected','MeanSuccessfulReset_s','MeanRRTPerSuccess_s'});
+    samplingSummary = [samplingSummary; row]; %#ok<AGROW>
+end
+fprintf('Configured obstacle sampling mode: %s\n',string(p.obstacleSamplingMode));
+disp(samplingSummary);
+armSelected = samplingMethods=="arm_sweep";
+anchorSummary = array2table(mean(anchorCounts(armSelected,:),1), ...
+    'VariableNames',{'MeanGenerated','MeanGeometricallyRejected','MeanRetained'});
+anchorSummary.ArmScenarios = nnz(armSelected);
+anchorSummary.NoFeasibleAnchors = nnz(noFeasibleAnchors);
+disp('Arm-sweep anchors per selected scenario (including failures):');
+disp(anchorSummary);
+if reportCollisionLinks
+    pairs = unique(firstCollisionPairs(firstCollisionPairs~=""));
+    pairCounts = zeros(numel(pairs),1);
+    for pairIndex = 1:numel(pairs)
+        pairCounts(pairIndex) = nnz(firstCollisionPairs==pairs(pairIndex));
+    end
+    disp('Detected pair at first colliding interpolation sample (not continuous first contact):');
+    disp(table(pairs,pairCounts,'VariableNames',{'DetectedPair','Scenarios'}));
+end
+% Include all RRT attempts within each accepted reset, including rejections.
+rrtTimingSummary = array2table(mean(rrtMeasurements(ok,:),1), ...
+    'VariableNames',{'MeanSetup_s','MeanPlanning_s', ...
+    'MeanVerification_s','MeanCollisionChecks'});
+disp('Mean RRT work per accepted scenario (all candidate attempts):');
+disp(rrtTimingSummary);
 fprintf('Start half-width multiplier %.2f; position-only IK tolerance %.4g m.\n', ...
     startRangeMultiplier,ikPositionTolerance);
 if nAccepted>0
@@ -196,6 +267,26 @@ end
 
 function verifyReset(obs,s,cfg)
     p=s.params; d=s.scenarioDiagnostics;
+    assert(d.armAnchorsGenerated==d.armAnchorsRejected+d.armAnchorsRetained);
+    if d.armNoFeasibleAnchors
+        assert(~d.success && d.failureStage=="obstacle" && d.attempts==0 && ...
+            d.obstacleSamplingMode=="arm_sweep" && ...
+            d.armAnchorsGenerated>0 && d.armAnchorsRetained==0);
+    end
+    if d.attempts>0 || d.armNoFeasibleAnchors
+        assert(any(d.obstacleSamplingMode==["ee_tube","arm_sweep"]));
+        if string(p.obstacleSamplingMode)~="mixed"
+            assert(d.obstacleSamplingMode==string(p.obstacleSamplingMode));
+        end
+    else
+        assert(d.obstacleSamplingMode=="");
+    end
+    if d.obstacleSamplingMode=="arm_sweep"
+        assert(d.armAnchorsGenerated==7*numel(p.armSweepFractions));
+        assert(d.armNoFeasibleAnchors==(d.armAnchorsRetained==0));
+    else
+        assert(d.armAnchorsGenerated==0 && ~d.armNoFeasibleAnchors);
+    end
     assert(d.attempts==d.targetPointRejects+d.startCollisionRejects+ ...
         d.goalCollisionRejects+d.workspaceRejects+d.rrtRejects+double(d.success));
     startPassed = d.failureStage~="start";
@@ -255,15 +346,41 @@ function verifyReset(obs,s,cfg)
         s.rrtRouteSteps<=cfg.maxSteps && s.rrtRouteSteps==floor(s.rrtRouteSteps));
 end
 
-function [blocked,selfBlocked,nSteps] = inspectInterpolation(s)
+function [blocked,selfBlocked,nSteps,firstCollisionPair] = ...
+        inspectInterpolation(s,reportCollisionLinks)
     q=s.q; dq=s.sampledGoalQ(1:7)-q(1:7);
     nSteps=max(1,ceil(max(abs(dq))/s.params.maxIncrement));
     assert(max(abs(dq/nSteps))<=s.params.maxIncrement+1e-12);
     blocked=false; selfBlocked=false;
+    firstCollisionPair = "";
     for j=1:nSteps
         qSample=q; qSample(1:7)=q(1:7)+(j/nSteps)*dq;
-        if collision.checkRobotCollision(s.robot,qSample,s.obstacle,s.params.skipPairs)
-            blocked=true; break;
+        if reportCollisionLinks
+            % Same query and early-stop policy as checkRobotCollision; only
+            % request the supported distance output for offline attribution.
+            [flags,separation] = checkCollision(s.robot,qSample,{s.obstacle}, ...
+                'SkippedSelfCollisions',s.params.skipPairs,'Exhaustive','off');
+            colliding = any(flags);
+        else
+            colliding = collision.checkRobotCollision( ...
+                s.robot,qSample,s.obstacle,s.params.skipPairs);
+        end
+        if colliding
+            blocked=true;
+            if reportCollisionLinks
+                % NaN marks a detected collision; unchecked pairs are Inf.
+                % An early self-collision may hide an obstacle collision.
+                [bodyIndex,otherIndex] = find(isnan(separation),1);
+                assert(~isempty(bodyIndex),'Collision API returned no detected pair.');
+                bodyNames = [string(s.robot.BodyNames(:)); string(s.robot.BaseName)];
+                if otherIndex<=s.robot.NumBodies+1
+                    firstCollisionPair = bodyNames(bodyIndex)+ ...
+                        " <-> "+bodyNames(otherIndex)+" (self)";
+                else
+                    firstCollisionPair = bodyNames(bodyIndex)+" <-> obstacle";
+                end
+            end
+            break;
         end
     end
     % Preserve the prior obstacle-free reference on blocked interpolations.

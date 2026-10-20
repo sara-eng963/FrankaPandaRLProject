@@ -41,6 +41,15 @@ function [InitialObs, LoggedSignals] = resetFunction(initialState)
             "targetDistanceRejects", 0, ...
             "rrtAttempts", 0, ...
             "rrtSeconds", 0, ...
+            "rrtSetupSeconds", 0, ...
+            "rrtPlanSeconds", 0, ...
+            "rrtVerifySeconds", 0, ...
+            "rrtCollisionChecks", 0, ...
+            "obstacleSamplingMode", "", ...
+            "armAnchorsGenerated", 0, ...
+            "armAnchorsRejected", 0, ...
+            "armAnchorsRetained", 0, ...
+            "armNoFeasibleAnchors", false, ...
             "obstacleRadius", NaN, ...
             "failureStage", "", ...
             "attempts", 0, ...
@@ -232,6 +241,24 @@ function [InitialObs, LoggedSignals] = resetFunction(initialState)
 
     %% 3. Spherical Obstacle
     if randomizeObstacle
+        samplingMode = "ee_tube";
+        if isfield(p, "obstacleSamplingMode")
+            samplingMode = string(p.obstacleSamplingMode);
+        end
+        assert(isscalar(samplingMode) && ...
+            any(samplingMode == ["ee_tube", "arm_sweep", "mixed"]), ...
+            "Invalid obstacle sampling mode.");
+        armSamplingProbability = 0.5;
+        if isfield(p, "armSamplingProbability")
+            armSamplingProbability = p.armSamplingProbability;
+        end
+        validateattributes(armSamplingProbability, {'numeric'}, ...
+            {'scalar', 'real', 'finite', '>=', 0, '<=', 1});
+        if samplingMode ~= "ee_tube"
+            assert(randomizeTarget, ...
+                "Arm-sweep sampling requires a sampled IK goal configuration.");
+        end
+
         fractionRange = p.obstacleFractionRange;
         offsetRange = p.obstacleOffsetRange;
         maxAttempts = p.maxObstacleAttempts;
@@ -278,6 +305,49 @@ if recordDiagnostics
     diag.obstacleRadius = obstacleRadius;
 end
 
+        % Select once, after start/goal and radius sampling. EE-tube consumes
+        % exactly its original random draws; only mixed draws a mode choice.
+        if samplingMode == "mixed"
+            if rand < armSamplingProbability
+                samplingMode = "arm_sweep";
+            else
+                samplingMode = "ee_tube";
+            end
+        end
+        if recordDiagnostics
+            diag.obstacleSamplingMode = samplingMode;
+        end
+
+        if samplingMode == "arm_sweep"
+            % Geometric link-frame approximations only, not collision volumes
+            % or a feasible route. Never supplied as actions to the RL agent.
+            fractions = [0.4 0.5 0.6];
+            if isfield(p, "armSweepFractions")
+                fractions = p.armSweepFractions;
+            end
+            validateattributes(fractions, {'double'}, ...
+                {'vector', 'nonempty', 'real', 'finite', '>', 0, '<', 1});
+            linkNames = ["panda_link4", "panda_link5", ...
+                         "panda_link6", "panda_link7"];
+            anchorsPerSample = 2*numel(linkNames)-1;
+            armAnchors = zeros(3, numel(fractions)*anchorsPerSample);
+            for sampleIndex = 1:numel(fractions)
+                qNominal = q;
+                qNominal(1:7) = q(1:7) + ...
+                    fractions(sampleIndex)*(qGoal(1:7)-q(1:7));
+                linkPositions = zeros(3, numel(linkNames));
+                for linkIndex = 1:numel(linkNames)
+                    TLink = getTransform(LoggedSignals.robot, qNominal, ...
+                        linkNames(linkIndex));
+                    linkPositions(:,linkIndex) = TLink(1:3,4);
+                end
+                % Origins plus segment midpoints, with no additional FK.
+                indices = (sampleIndex-1)*anchorsPerSample+(1:anchorsPerSample);
+                armAnchors(:,indices) = [linkPositions, ...
+                    (linkPositions(:,1:end-1)+linkPositions(:,2:end))/2];
+            end
+        end
+
         if recordDiagnostics
             % Codes: 1=target overlap, 2=start robot, 3=goal robot,
             % 4=accepted, 5=outside workspace, 6=RRT.
@@ -313,6 +383,48 @@ if useWorkspaceBox
         "Sphere is too large to fit inside the workspace.");
 end
 
+if samplingMode == "arm_sweep"
+    % IK goal sampling already requires workspaceBox. A box intersects the
+    % allowed offset shell iff its nearest distance is <= the outer radius
+    % and its farthest distance is >= the inner radius. Keep outside anchors
+    % whenever they can reach that intersection; no collision approximation.
+    armNearest = min(max(armAnchors,centerMin),centerMax);
+    armFarthest = centerMin + (centerMax-centerMin).* ...
+        (abs(centerMax-armAnchors)>=abs(centerMin-armAnchors));
+    nearestDistances = sqrt(sum((armNearest-armAnchors).^2,1));
+    farthestDistances = sqrt(sum((armFarthest-armAnchors).^2,1));
+    feasibleAnchors = nearestDistances<=offsetRange(2) & ...
+        farthestDistances>=offsetRange(1);
+    if recordDiagnostics
+        diag.armAnchorsGenerated = size(armAnchors,2);
+        diag.armAnchorsRetained = nnz(feasibleAnchors);
+        diag.armAnchorsRejected = nnz(~feasibleAnchors);
+        if isfield(p,"recordObstacleSamplingGeometry") && ...
+                isequal(p.recordObstacleSamplingGeometry,true)
+            % Opt-in offline inspection only: retain the exact pre-filter data.
+            diag.armSamplingGeometry = struct('rawAnchors',armAnchors, ...
+                'feasibleMask',feasibleAnchors, ...
+                'midpointMask',repmat([false(1,4) true(1,3)],1,numel(fractions)), ...
+                'fractions',fractions);
+        end
+    end
+    if ~any(feasibleAnchors)
+        if recordDiagnostics
+            diag.armNoFeasibleAnchors = true;
+            diag.failureStage = "obstacle";
+            diag.candidateCenters = zeros(0,3);
+            diag.candidateCodes = zeros(0,1,"uint8");
+            LoggedSignals.scenarioDiagnostics = diag;
+            InitialObs = [];
+            return;
+        end
+        error("Reset failed: no geometrically feasible arm-sweep anchors.");
+    end
+    armAnchors = armAnchors(:,feasibleAnchors);
+    armNearest = armNearest(:,feasibleAnchors);
+    armFarthest = armFarthest(:,feasibleAnchors);
+end
+
 
         accepted = false;
 
@@ -322,14 +434,21 @@ for attempt = 1:maxAttempts
         diag.attempts = attempt;
     end
 
-    % 1. Random position along the start-target segment.
-    alpha = fractionRange(1) + rand * diff(fractionRange);
-    theta = 2*pi*rand;
+    if samplingMode == "arm_sweep"
+        anchorIndex = randi(size(armAnchors,2));
+        anchor = armAnchors(:,anchorIndex);
+        lateralDir = armSweepDirection(anchor, armNearest(:,anchorIndex), ...
+            armFarthest(:,anchorIndex), centerMin, centerMax, offsetRange);
+    else
+        % 1. Random position along the start-target segment.
+        alpha = fractionRange(1) + rand * diff(fractionRange);
+        theta = 2*pi*rand;
 
-    anchor = pStart + alpha*segment;
+        anchor = pStart + alpha*segment;
 
-    % Random perpendicular direction.
-    lateralDir = cos(theta)*lateral1 + sin(theta)*lateral2;
+        % Random perpendicular direction.
+        lateralDir = cos(theta)*lateral1 + sin(theta)*lateral2;
+    end
 
     % 2. Start with the configured lateral-offset range.
     rhoMin = offsetRange(1);
@@ -426,19 +545,20 @@ if useRRT
     if recordDiagnostics
         diag.rrtAttempts = diag.rrtAttempts+1;
         rrtTimer = tic;
-    end
-    [feasible, routeSteps] = ...
-        environment.checkScenarioFeasibility( ...
-            LoggedSignals.robot, ...
-            q, ...
-            LoggedSignals.sampledGoalQ, ...
-            candidate, ...
-            p.skipPairs, ...
-            p.maxIncrement, ...
-            p.maxSteps, ...
-            p.rrt);
-    if recordDiagnostics
+        [feasible, routeSteps, rrtStats] = ...
+            environment.checkScenarioFeasibility( ...
+                LoggedSignals.robot, q, LoggedSignals.sampledGoalQ, ...
+                candidate, p.skipPairs, p.maxIncrement, p.maxSteps, p.rrt);
         diag.rrtSeconds = diag.rrtSeconds+toc(rrtTimer);
+        diag.rrtSetupSeconds = diag.rrtSetupSeconds+rrtStats.setupSeconds;
+        diag.rrtPlanSeconds = diag.rrtPlanSeconds+rrtStats.planningSeconds;
+        diag.rrtVerifySeconds = diag.rrtVerifySeconds+rrtStats.verificationSeconds;
+        diag.rrtCollisionChecks = diag.rrtCollisionChecks+rrtStats.collisionChecks;
+    else
+        [feasible, routeSteps] = ...
+            environment.checkScenarioFeasibility( ...
+                LoggedSignals.robot, q, LoggedSignals.sampledGoalQ, ...
+                candidate, p.skipPairs, p.maxIncrement, p.maxSteps, p.rrt);
     end
 
     if ~feasible
@@ -499,4 +619,41 @@ break;
         obstaclePosition;
         LoggedSignals.obstacle.Radius
     ];
+end
+
+function direction = armSweepDirection(anchor, nearest, farthest, ...
+        centerMin, centerMax, offsetRange)
+% Choose a direction through a reachable box point, without rejection loops.
+% Along the segment from the nearest box point to any other box point,
+% distance from the anchor is monotone. Randomize the endpoint and a reachable
+% radius; the caller then samples its usual clipped offset along this ray.
+% This intentionally biases directions toward the workspace, not uniformly
+% over the sphere. Segment interiors preserve spatial variation in the box.
+    endpoint = centerMin + rand(3,1).*(centerMax-centerMin);
+    nearestDistance = norm(nearest-anchor);
+    lowerRadius = max(offsetRange(1),nearestDistance);
+    if norm(endpoint-anchor)<lowerRadius
+        endpoint = farthest;
+    end
+    upperRadius = min(offsetRange(2),norm(endpoint-anchor));
+    radius = lowerRadius + rand*max(0,upperRadius-lowerRadius);
+    segment = endpoint-nearest;
+    segmentSquared = dot(segment,segment);
+    b = dot(nearest-anchor,segment);
+    delta = max(0,radius^2-nearestDistance^2);
+    denominator = b + sqrt(max(0,b^2+segmentSquared*delta));
+    fraction = 0;
+    if denominator>0
+        % Stable positive root of the line/sphere intersection equation.
+        fraction = min(1,max(0,delta/denominator));
+    end
+    direction = nearest + fraction*segment - anchor;
+    if norm(direction)==0
+        direction = farthest-anchor;
+        if norm(direction)==0
+            % Degenerate zero-offset, point-sized box: any ray admits rho=0.
+            direction = [1;0;0];
+        end
+    end
+    direction = direction/norm(direction);
 end
