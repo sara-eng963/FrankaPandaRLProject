@@ -1,13 +1,21 @@
-function [InitialObs, LoggedSignals] = resetFunction(initialState)
+function [InitialObs, LoggedSignals, status] = resetFunction(initialState)
 %RESETFUNCTION Initialize a Panda obstacle-avoidance RL episode.
 % Samples optional start, target and sphere configurations. The Cartesian
 % workspace constrains episode starts and targets, not intermediate motion.
 % Cartesian goals are validated with position-only IK; RRT validates scenarios.
 % Neither solver supplies actions to the RL agent or runs in stepFunction.
+% Optional third output reports expected bounded sampling exhaustion without
+% throwing or enabling detailed diagnostics. Unexpected errors still propagate.
+% Existing one/two-output callers retain their original failure behavior.
 
     LoggedSignals = initialState;
     p = LoggedSignals.params;
     q = LoggedSignals.q;
+    recordStatus = nargout >= 3;
+    if recordStatus
+        status = struct('success',false,'failureStage',"", ...
+            'obstacleSamplingMode',"",'obstacleRadius',NaN,'targetDistance',NaN);
+    end
 
     randomizeStart = isfield(p, "startJointRanges");
     randomizeTarget = isfield(p, "ikSolver");
@@ -150,9 +158,14 @@ function [InitialObs, LoggedSignals] = resetFunction(initialState)
         end
 
         if ~accepted
+            if recordStatus, status.failureStage="start"; end
             if recordDiagnostics
                 diag.failureStage = "start";
                 LoggedSignals.scenarioDiagnostics = diag;
+                InitialObs = [];
+                return;
+            end
+            if recordStatus
                 InitialObs = [];
                 return;
             end
@@ -216,9 +229,14 @@ function [InitialObs, LoggedSignals] = resetFunction(initialState)
             diag.goalPositionError = g.positionError;
         end
         if ~g.success
+            if recordStatus, status.failureStage="target"; end
             if recordDiagnostics
                 diag.failureStage = "target";
                 LoggedSignals.scenarioDiagnostics = diag;
+                InitialObs = [];
+                return;
+            end
+            if recordStatus
                 InitialObs = [];
                 return;
             end
@@ -304,6 +322,10 @@ end
 if recordDiagnostics
     diag.obstacleRadius = obstacleRadius;
 end
+if recordStatus
+    status.obstacleRadius = obstacleRadius;
+    status.targetDistance = norm(LoggedSignals.target-pStart);
+end
 
         % Select once, after start/goal and radius sampling. EE-tube consumes
         % exactly its original random draws; only mixed draws a mode choice.
@@ -317,6 +339,7 @@ end
         if recordDiagnostics
             diag.obstacleSamplingMode = samplingMode;
         end
+        if recordStatus, status.obstacleSamplingMode=samplingMode; end
 
         if samplingMode == "arm_sweep"
             % Geometric link-frame approximations only, not collision volumes
@@ -409,12 +432,17 @@ if samplingMode == "arm_sweep"
         end
     end
     if ~any(feasibleAnchors)
+        if recordStatus, status.failureStage="obstacle"; end
         if recordDiagnostics
             diag.armNoFeasibleAnchors = true;
             diag.failureStage = "obstacle";
             diag.candidateCenters = zeros(0,3);
             diag.candidateCodes = zeros(0,1,"uint8");
             LoggedSignals.scenarioDiagnostics = diag;
+            InitialObs = [];
+            return;
+        end
+        if recordStatus
             InitialObs = [];
             return;
         end
@@ -593,9 +621,14 @@ break;
             diag.candidateCodes = diag.candidateCodes(1:diag.attempts);
         end
         if ~accepted
+            if recordStatus, status.failureStage="obstacle"; end
             if recordDiagnostics
                 diag.failureStage = "obstacle";
                 LoggedSignals.scenarioDiagnostics = diag;
+                InitialObs = [];
+                return;
+            end
+            if recordStatus
                 InitialObs = [];
                 return;
             end
@@ -619,6 +652,7 @@ break;
         obstaclePosition;
         LoggedSignals.obstacle.Radius
     ];
+    if recordStatus, status.success=true; end
 end
 
 function direction = armSweepDirection(anchor, nearest, farthest, ...

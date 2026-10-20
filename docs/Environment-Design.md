@@ -1,6 +1,6 @@
 # Franka Panda RL Environment — Engineering Notes
 
-Updated: 2026-10-19
+Updated: 2026-10-20
 Course: MCT464 Selected Topics in Robotics & AI  
 Status: **Pre-training validation**; do not interpret unexecuted code as a passed test.
 
@@ -19,7 +19,9 @@ Status: **Pre-training validation**; do not interpret unexecuted code as a passe
 |---|---|
 | Robot, joint limits, collision exclusions, course settings | `Scripts/robot_setup.m` |
 | MathWorks RL observation/action specs and interface | `Scripts/create_rl_environment.m` |
+| Shared validated randomized-scenario configuration and reusable IK solver | `+environment/configureScenarioParameters.m` |
 | Sampling start, reachable target, and sphere | `+environment/resetFunction.m` |
+| Bounded complete-scenario retries with one fixed method per requested episode | `+environment/resetEpisodeWithRetries.m` |
 | Cartesian target proposals and position-only IK validation | `+environment/sampleGoalConfiguration.m` |
 | State transition, collision penalties, reward, termination | `+environment/stepFunction.m` |
 | Full-arm collision and end-effector forward kinematics | `+collision/checkRobotCollision.m`, `+kinematics/forwardKinematics.m` |
@@ -46,6 +48,39 @@ $$
 
 plus the existing success bonus or terminal failure penalty. The numerical scales should be evaluated before changing weights.
 
+## Creating diagnostic and training environments
+
+Run from the project root:
+
+```matlab
+environmentMode = "diagnostic";
+run('Scripts/create_rl_environment.m');
+obs = reset(env);
+
+environmentMode = "training";
+run('Scripts/create_rl_environment.m');
+obs = reset(env);
+```
+
+If `environmentMode` is absent, creation defaults to **diagnostic**: the original ready configuration, fixed target, distant 3 cm placeholder sphere, and raw single-scenario reset. The scenario diagnostic explicitly requests this mode, regardless of a caller's previous training selection. Each creation starts with fresh state/parameter structures so mode switches cannot retain randomized fields.
+
+**Training** uses the shared validated settings in `environment.configureScenarioParameters`, also used by `tests/testEnvironment.m` and consequently the existing reliability benchmark. Start half-widths, IK settings, workspace, 15–50 cm target distances, 3–6 cm radii, obstacle ranges and RRT parameters are unchanged. Training explicitly sets `mixed`, probability `0.5`, and `maxScenarioAttempts=10`. Its reset callback is `@() environment.resetEpisodeWithRetries(initialState)`; each requested episode selects one method and keeps it through its bounded complete retries. Exhaustion and unexpected errors propagate. The wrapper's standalone default remains five; training's ten-attempt limit is explicit.
+
+The IK solver is constructed once per randomized environment, with construction isolated from the caller's RNG. Normal resets advance the active random stream; they do not reseed. Both modes use `@environment.stepFunction` and the unchanged 14D observation and 7D action specifications. The accepted reset state passes through the documented `env.Info` property, not the deprecated `LoggedSignals` property. IK witnesses remain internal state and RRT paths are not policy inputs.
+
+Training disables scenario/candidate-history recording, arm visualization geometry and robot setup figures. Only the wrapper's lightweight retry statistics remain; its elapsed timing is disabled for the two-output RL reset callback. Standalone robot setup retains its visualization default.
+
+`rlFunctionEnv` automatically validates its callbacks on construction, including a reset and step; creating a training environment can therefore consume randomized scenarios and time before the first explicit `reset(env)`. Explicit `validateEnvironment(env)` also resets/steps it. Set the external experiment seed **before construction** when reproducing an entire initialization sequence. Keep `cfg.evalSeed` reserved. [MathWorks R2025b reference](https://www.mathworks.com/help/releases/R2025b/reinforcement-learning/ref/rl.env.rlfunctionenv.html).
+
+Manual interface smoke check:
+
+```matlab
+trainingEnvironmentTestOptions = struct('nResets',5,'seed',314159);
+run('tests/testTrainingEnvironment.m');
+```
+
+This checks the actual environment interface, state handoff, consecutive variation, external seeded replay, both explicit modes and the fixed default. It uses the public `Info`, `StepFcn`, specification accessors and `validateEnvironment`; it does not invoke the retry wrapper directly. Setup figures are hidden and cleaned up. The existing raw diagnostic, reliability benchmark and offline inspector remain separate workflows. The user reported 100/100 successful mixed resets at a ten-attempt limit; this environment integration and its new test have **not** been runtime-validated as part of the source changes.
+
 ## What was actually verified
 
 Position-only IK verification on 2026-10-19 using MATLAB R2025b:
@@ -68,7 +103,7 @@ Historical MATLAB results supplied for the **local fixed 3 cm sphere configurati
 - None of the 28 corresponding obstacle-free interpolations were self-colliding at tested configurations.
 - All 28 nominal direct interpolations fit the 400-step action-count bound.
 
-These historical checks establish obstruction of sampled nominal whole-arm motion, not alternative-route feasibility. They are not measurements of the current randomized 3–6 cm sphere configuration. The interface fixture in `Scripts/create_rl_environment.m` uses a distant 3 cm placeholder sphere; the scenario diagnostic configures the actual randomized obstacle separately.
+These historical checks establish obstruction of sampled nominal whole-arm motion, not alternative-route feasibility. They are not measurements of the current randomized 3–6 cm sphere configuration. The default diagnostic interface fixture in `Scripts/create_rl_environment.m` uses a distant 3 cm placeholder sphere; training mode and the scenario diagnostic configure randomized obstacles separately.
 
 Two alternative routes were also validated in an earlier exploratory MATLAB run (131 and 224 joint-increment steps). Those historical examples do not establish feasibility for the full randomized distribution.
 
@@ -80,21 +115,21 @@ Starts retain uniform joint-space sampling. Goals are proposed uniformly in the 
 
 - Original arm-joint half-widths about `qReady`: `[30 40 30 30 30 35 40]` degrees.
 - `startRangeMultiplier = 1`; start intervals are clamped to the robot model's physical joint limits. Goal joint intervals are no longer configured; IK may use all physical arm-joint limits.
-- `targetDistanceRange = [0.15 0.40]` metres. An infinite upper bound omits the optional maximum-distance filter. The minimum must exceed the existing position tolerance. Both requested XYZ and the FK witness must satisfy the workspace and distance constraints.
+- `targetDistanceRange = [0.15 0.50]` metres. An infinite upper bound omits the optional maximum-distance filter. The minimum must exceed the existing position tolerance. Both requested XYZ and the FK witness must satisfy the workspace and distance constraints.
 - Goal randomization is enabled by a prebuilt `p.ikSolver`. Omit it only for intentionally fixed-target fixtures. The obsolete `goalJointRanges` setting no longer enables goal randomization.
 - `inverseKinematics` uses Levenberg–Marquardt and weights `[0 0 0 1 1 1]`: all orientation weights are zero. The transform's rotation is therefore unconstrained. [MathWorks documents the weights and solver interface.](https://www.mathworks.com/help/robotics/ref/inversekinematics-system-object.html)
 - Defaults: `maxTargetAttempts = 200` Cartesian proposals, `ikMaxInitialGuesses = 3` per distance-admissible target, `ikMaxIterations = 100`, `ikMaxTime = 1` second per solve, and `ikPositionTolerance = 0.001` metres. The solver's `ikSolutionTolerance = 1e-6` is also configurable. The independent FK tolerance must not exceed the task position tolerance.
 - The first guess is the sampled start; later guesses uniformly sample the physical arm limits. Fixed fingers are restored before checking FK, position error, physical limits, workspace/distance bounds and exact self-collision (plus a static obstacle, when applicable). Every returned witness passes these checks, even if the solver reports only a best-available iterate.
 - Automatic IK random restarts are disabled; explicit retries use the reset's random stream. Solver construction is isolated from the caller's RNG in the diagnostic. A binding time limit can affect repeatability under load; time-limit exits are reported separately.
 - Sphere radius is drawn once per reset from `[0.03 0.06]` metres. Collision and workspace checks still reject unsuitable samples.
-- Reset attempts remain bounded. Exhaustion is reported by stage in diagnostic mode; ordinary RL resets still throw their existing exhaustion errors.
+- Raw single-scenario attempts remain bounded. Exhaustion is reported by stage in diagnostic mode; raw normal calls retain their existing errors. Training uses the explicit complete-scenario wrapper and raises a named error if all ten complete attempts fail.
 
 The diagnostic accepts overrides without changing the reset algorithm:
 
 ```matlab
 environmentDiagnosticOptions = struct('nEpisodes',3,'doVisualize',false, ...
     'startRangeMultiplier',1,'ikMaxInitialGuesses',3, ...
-    'targetDistanceRange',[0.15 0.40],'seed',2026);
+    'targetDistanceRange',[0.15 0.50],'seed',314159);
 run('tests/testEnvironment.m');
 environmentDiagnosticOptions.nEpisodes = 30;
 run('tests/testEnvironment.m');

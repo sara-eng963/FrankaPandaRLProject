@@ -34,6 +34,8 @@ validateattributes(ikMaxTime,{'double'},{'scalar','finite','positive'});
 validateattributes(targetDistanceRange,{'double'},{'size',[1 2],'nonnan'});
 projectRoot = fileparts(fileparts(mfilename('fullpath')));
 addpath(projectRoot);
+% Never inherit a training-mode variable left in the caller's workspace.
+environmentMode = "diagnostic";
 run(fullfile(projectRoot,'Scripts','create_rl_environment.m'));
 assert(cfg.evalSeed<diagnosticSeed || cfg.evalSeed>diagnosticSeed+nEpisodes-1, ...
     'Diagnostic seed range must exclude the reserved evaluation seed.');
@@ -47,33 +49,10 @@ assert(isfinite(targetDistanceRange(1)) && targetDistanceRange(1)>cfg.posTol && 
 disp('PASS: RL reset/step interface.');
 
 %% Original joint-space starts; Cartesian-first goals with a reusable solver.
-halfWidths = deg2rad(halfWidthsDegrees).';
-startWidths = startRangeMultiplier*halfWidths;
 p = initialState.params;
-p.startJointRanges = [max(qReady(:)-startWidths,jointLimits(:,1)), ...
-                     min(qReady(:)+startWidths,jointLimits(:,2))];
 p.workspaceBox = cfg.box;
-p.maxResetAttempts = 200;
-p.maxTargetAttempts = option(controls,'maxTargetAttempts',200);
-p.ikSolver = createIKSolver(robot,ikMaxIterations,ikMaxTime,ikSolutionTolerance);
-p.ikMaxInitialGuesses = ikMaxInitialGuesses;
-p.ikPositionTolerance = ikPositionTolerance;
-p.minTargetDistance = targetDistanceRange(1);
-% Infinite upper distance means no upper-distance restriction in reset.
-if isfinite(targetDistanceRange(2))
-    p.maxTargetDistance = targetDistanceRange(2);
-end
-p.obstacleRadiusRange = [0.03 0.06];
-p.obstacleFractionRange = [0.4 0.6];
-p.obstacleOffsetRange = [0.02 0.08];
-p.obstacleSamplingMode = option(controls,'obstacleSamplingMode',"ee_tube");
-p.armSamplingProbability = option(controls,'armSamplingProbability',0.5);
-p.armSweepFractions = option(controls,'armSweepFractions',[0.4 0.5 0.6]);
-p.maxObstacleAttempts = 100;
-p.rrt = struct('enabled',true,'maxIterations',750, ...
-    'maxConnectionDistance',0.3,'validationDistance',0.01);
+p = environment.configureScenarioParameters(robot,qReady,p,controls);
 p.recordScenarioDiagnostics = true;
-p.recordObstacleSamplingGeometry = option(controls,'recordObstacleSamplingGeometry',false);
 scenarioState = initialState;
 scenarioState.params = p;
 
@@ -242,18 +221,6 @@ disp('PASS: FK, workspace, radii, collision safety, route constraints, accountin
 
 function value = option(s,name,default)
     if isfield(s,name), value=s.(name); else, value=default; end
-end
-
-function solver = createIKSolver(robot,maxIterations,maxTime,solutionTolerance)
-    % MATLAB solver construction also uses randomness. Isolate that setup;
-    % target sampling itself uses each reset's existing private stream.
-    caller = RandStream.getGlobalStream;
-    guard = onCleanup(@() RandStream.setGlobalStream(caller));
-    RandStream.setGlobalStream(RandStream('mt19937ar','Seed',0));
-    solver = inverseKinematics('RigidBodyTree',robot,'SolverAlgorithm','LevenbergMarquardt');
-    solver.SolverParameters = struct('MaxIterations',maxIterations, ...
-        'MaxTime',maxTime,'SolutionTolerance',solutionTolerance, ...
-        'EnforceJointLimits',true,'AllowRandomRestart',false);
 end
 
 function [obs,s,elapsed] = runReset(state,seed)

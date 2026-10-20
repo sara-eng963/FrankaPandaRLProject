@@ -33,6 +33,11 @@ cfg.evalSeed  = 2027;
 
 % Enable for inspection; disable for automated training.
 cfg.visualizeRobot = true;
+% Environment creation supplies a temporary override for headless training.
+if exist('robotSetupVisualize','var')
+    validateattributes(robotSetupVisualize,{'logical'},{'scalar'});
+    cfg.visualizeRobot = robotSetupVisualize;
+end
 
 % TA-specified initial actor/critic network size.
 netSize = struct( ...

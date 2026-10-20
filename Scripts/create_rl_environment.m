@@ -1,20 +1,28 @@
 
-%% Panda RL Environment — Diagnostic Configuration
+%% Panda RL Environment — Fixed Diagnostic or Randomized Training
 % Creates a standard MATLAB RL environment using the
 % existing step/reset functions and official course limits.
 %
-% The scenario below is for integration testing only.
-% Training scenarios will be configured separately.
+% Default: environmentMode = "diagnostic" (the original fixed interface fixture).
+% Set environmentMode = "training" before running for randomized resets.
 
 %% 1. Robot and Project Setup
 
 projectRoot = fileparts(fileparts(mfilename("fullpath")));
 addpath(projectRoot);
 
+if ~exist('environmentMode','var'), environmentMode="diagnostic"; end
+environmentMode = string(environmentMode);
+assert(isscalar(environmentMode) && any(environmentMode==["diagnostic","training"]), ...
+    'Invalid environmentMode: use diagnostic or training.');
+robotSetupVisualize = environmentMode~="training";
 run(fullfile(projectRoot, "Scripts", "robot_setup.m"));
+clear robotSetupVisualize
 
 %% 2. Environment Parameters
 
+% Fresh structures prevent training fields leaking into a later diagnostic run.
+envParams = struct();
 envParams.jointLimits = jointLimits;
 envParams.skipPairs = skipPairs;
 
@@ -30,12 +38,22 @@ envParams.reward.step = 0.01;
 envParams.reward.success = 10;
 envParams.reward.failure = 10;
 
-%% 3. Diagnostic Scenario
+if environmentMode=="training"
+    envParams = environment.configureScenarioParameters(robot,qReady,envParams);
+    envParams.obstacleSamplingMode = "mixed";
+    envParams.armSamplingProbability = 0.5;
+    envParams.maxScenarioAttempts = 10;
+    envParams.recordScenarioDiagnostics = false;
+    envParams.recordObstacleSamplingGeometry = false;
+end
+
+%% 3. Fixed Fixture / Original Template for Randomized Resets
 
 % Distant obstacle isolates environment-interface behavior.
 obstacle = collisionSphere(0.03);
 obstacle.Pose = trvec2tform([3, 3, 3]);
 
+initialState = struct();
 initialState.robot = robot;
 initialState.q = qReference;
 initialState.eeFrame = eeFrame;
@@ -60,9 +78,16 @@ actInfo.UpperLimit =  cfg.maxIncrement * ones(7,1);
 
 %% 5. Construct Environment
 
+if environmentMode=="training"
+    resetFcn = @() environment.resetEpisodeWithRetries(initialState);
+else
+    resetFcn = @() environment.resetFunction(initialState);
+end
+% rlFunctionEnv obtains the accepted state from reset's second output (Info).
+% Its constructor validates the interface, including an initial reset/step.
 env = rlFunctionEnv( ...
     obsInfo, actInfo, ...
     @environment.stepFunction, ...
-    @() environment.resetFunction(initialState));
+    resetFcn);
 
-disp("PASS: Panda RL environment created.");
+disp("Panda RL environment created ("+environmentMode+").");
