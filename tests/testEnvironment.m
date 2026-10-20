@@ -12,7 +12,7 @@ maxVisibleScenarios = option(controls,'maxVisibleScenarios',30);
 diagnosticSeed = option(controls,'seed',2026);
 halfWidthsDegrees = option(controls,'halfWidthsDegrees',[30 40 30 30 30 35 40]);
 startRangeMultiplier = option(controls,'startRangeMultiplier',1);
-targetDistanceRange = option(controls,'targetDistanceRange',[0.15 0.40]);
+targetDistanceRange = option(controls,'targetDistanceRange',[0.15 0.50]);
 ikMaxInitialGuesses = option(controls,'ikMaxInitialGuesses',3);
 ikMaxIterations = option(controls,'ikMaxIterations',100);
 ikMaxTime = option(controls,'ikMaxTime',1);
@@ -164,8 +164,7 @@ fprintf('Direct interpolation: blocked=%d, self-blocked=%d, over horizon=%d.\n',
     nnz(nominalBlocked(ok)),nnz(selfBlocked(ok)),nnz(nominalSteps(ok)>cfg.maxSteps));
 disp('RRT validates discrete full-arm routes; continuous swept clearance is not established.');
 if doVisualize
-    showOverview(starts(ok,:),goals(ok,:),cfg.box,nEpisodes);
-    showInspector(episodes,find(ok),robot,cfg.box,maxVisibleScenarios);
+    showDashboard(episodes,find(ok),robot,cfg.box,nEpisodes,maxVisibleScenarios);
 end
 assert(isequal(rngBefore,rng));
 disp('PASS: FK, workspace, radii, collision safety, route constraints, accounting and reproducibility.');
@@ -278,47 +277,6 @@ function [blocked,selfBlocked,nSteps] = inspectInterpolation(s)
     end
 end
 
-function showOverview(starts,goals,workspace,nAttempted)
-    % Show every accepted episode in one workspace, independent of the
-    % inspector's maxVisibleScenarios cap.
-    fig=figure('Name','Panda accepted scenarios overview', ...
-        'NumberTitle','off','Color',[0.10 0.12 0.16], ...
-        'Position',[80 100 1050 700]);
-    ax=axes('Parent',fig,'Position',[0.08 0.11 0.78 0.79]);
-    hold(ax,'on');
-    drawWorkspaceBox(ax,workspace);
-    hStart=scatter3(ax,starts(:,1),starts(:,2),starts(:,3), ...
-        55,[0.24 0.82 0.58],'filled');
-    hGoal=scatter3(ax,goals(:,1),goals(:,2),goals(:,3), ...
-        55,[0.99 0.36 0.43],'filled');
-    finishAxes(ax);
-    % Unlike the inspector, show the entire task box at useful scale.
-    margin=0.035;
-    xlim(ax,workspace(1,:)+[-margin margin]);
-    ylim(ax,workspace(2,:)+[-margin margin]);
-    zlim(ax,workspace(3,:)+[-margin margin]);
-    title(ax,sprintf('Accepted scenarios: %d/%d',size(goals,1),nAttempted), ...
-        'Color','w');
-    legend(ax,[hStart hGoal],{'Start','Goal'}, ...
-        'Location','northeastoutside','TextColor','w', ...
-        'Color',[0.10 0.12 0.16]);
-end
-
-function showInspector(episodes,available,robot,workspace,maxVisible)
-    if isempty(available), return; end
-    available=available(1:min(maxVisible,numel(available)));
-    fig=figure('Name','Panda accepted scenario inspection', ...
-        'NumberTitle','off','Color',[0.10 0.12 0.16],'Position',[100 100 1350 660]);
-    ax=axes('Parent',fig,'Position',[0.06 0.09 0.88 0.77]);
-    [sx,sy,sz]=feval('sphere',16);
-    data=struct('axes',ax,'figure',fig,'episodes',{episodes},'indices',available, ...
-        'robot',robot,'workspace',workspace,'sphereX',sx,'sphereY',sy,'sphereZ',sz);
-    selection=uicontrol(fig,'Style','popupmenu','Units','normalized', ...
-        'Position',[0.78 0.93 0.18 0.045],'String',cellstr("Episode "+string(available)));
-    selection.Callback=@(src,~) renderSelectedScenario(data,src.Value);
-    renderSelectedScenario(data,1);
-end
-
 %% Local visualization routines (not called by the RL environment)
 function drawWorkspaceBox(ax,limits)
     x=limits(1,:); y=limits(2,:); z=limits(3,:);
@@ -391,4 +349,82 @@ function renderSelectedScenario(data,selection)
     title(ax,sprintf("Episode %d | %s | %.1f cm | %d candidates", ...
         data.indices(selection),char(episodeLabel), ...
         100*norm(b-a),n),"Color","w");
+end
+
+function showDashboard(episodes,available,robot,workspace,nAttempted,maxVisible)
+    % One figure: all accepted start-goal pairs and a selected-episode inspector.
+    % Use the already collected diagnostics; never generate new scenarios here.
+    if isempty(available)
+        warning('No accepted scenarios to visualize.');
+        return;
+    end
+
+    available=available(:);
+    n=numel(available);
+    starts=zeros(n,3);
+    goals=zeros(n,3);
+    for i=1:n
+        ep=episodes{available(i)};
+        starts(i,:)=ep.pEE(:).';
+        goals(i,:)=ep.target(:).';
+    end
+
+    fig=figure('Name','Panda accepted scenarios dashboard', ...
+        'NumberTitle','off','Color',[0.10 0.12 0.16], ...
+        'Position',[60 80 1500 780]);
+
+    %% Left: accepted start-goal pairs (ALL accepted episodes)
+    axOverview=axes('Parent',fig,'Position',[0.05 0.12 0.43 0.72]);
+    hold(axOverview,'on');
+    drawWorkspaceBox(axOverview,workspace);
+    for i=1:n
+        plot3(axOverview,[starts(i,1) goals(i,1)], ...
+            [starts(i,2) goals(i,2)], ...
+            [starts(i,3) goals(i,3)],'-', ...
+            'Color',[0.53 0.58 0.65],'LineWidth',0.8, ...
+            'HandleVisibility','off');
+    end
+    selectedLine=plot3(axOverview,[starts(1,1) goals(1,1)], ...
+        [starts(1,2) goals(1,2)],[starts(1,3) goals(1,3)],'-', ...
+        'Color',[1.0 0.79 0.31],'LineWidth',2.6, ...
+        'HandleVisibility','off');
+    hStart=scatter3(axOverview,starts(:,1),starts(:,2),starts(:,3), ...
+        48,[0.24 0.82 0.58],'filled');
+    hGoal=scatter3(axOverview,goals(:,1),goals(:,2),goals(:,3), ...
+        48,[0.99 0.36 0.43],'filled');
+    finishAxes(axOverview);
+    margin=0.035;
+    xlim(axOverview,workspace(1,:)+[-margin margin]);
+    ylim(axOverview,workspace(2,:)+[-margin margin]);
+    zlim(axOverview,workspace(3,:)+[-margin margin]);
+    title(axOverview,sprintf('Accepted scenarios: %d/%d',n,nAttempted), ...
+        'Color','w','FontWeight','bold');
+    legend(axOverview,[hStart hGoal],{'Start','Goal'}, ...
+        'Location','northwest','TextColor','w', ...
+        'Color',[0.10 0.12 0.16]);
+
+    %% Right: reuse the existing, tested scenario renderer
+    axInspect=axes('Parent',fig,'Position',[0.54 0.11 0.43 0.72]);
+    [sx,sy,sz]=feval('sphere',16);
+    inspectIndices=available(1:min(maxVisible,n));
+    data=struct('axes',axInspect,'figure',fig,'episodes',{episodes}, ...
+        'indices',inspectIndices,'robot',robot,'workspace',workspace, ...
+        'sphereX',sx,'sphereY',sy,'sphereZ',sz);
+    selection=uicontrol(fig,'Style','popupmenu','Units','normalized', ...
+        'Position',[0.78 0.94 0.18 0.043], ...
+        'String',cellstr("Episode "+string(inspectIndices)), ...
+        'BackgroundColor',[0.12 0.14 0.18],'ForegroundColor','w');
+    selection.Callback=@(src,~) selectDashboardEpisode( ...
+        data,src.Value,available,starts,goals,selectedLine);
+    selectDashboardEpisode(data,1,available,starts,goals,selectedLine);
+end
+
+function selectDashboardEpisode(data,selection,available,starts,goals,selectedLine)
+    % Update the inspector and highlight the corresponding pair at left.
+    renderSelectedScenario(data,selection);
+    idx=find(available==data.indices(selection),1);
+    set(selectedLine, ...
+        'XData',[starts(idx,1) goals(idx,1)], ...
+        'YData',[starts(idx,2) goals(idx,2)], ...
+        'ZData',[starts(idx,3) goals(idx,3)]);
 end
