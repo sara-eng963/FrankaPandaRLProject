@@ -16,6 +16,8 @@ environmentMode = string(environmentMode);
 assert(isscalar(environmentMode) && any(environmentMode==["diagnostic","training"]), ...
     'Invalid environmentMode: use diagnostic or training.');
 robotSetupVisualize = environmentMode~="training";
+
+
 run(fullfile(projectRoot, "Scripts", "robot_setup.m"));
 clear robotSetupVisualize
 

@@ -106,6 +106,10 @@ function [InitialObs, LoggedSignals, status] = resetFunction(initialState)
         if recordDiagnostics
             startTimer = tic;
         end
+        % Sample random starting joint configurations (uniform distribution).
+        % Each arm joint is sampled independently within its allowed range:
+        % q_i = q_min,i + u_i * (q_max,i - q_min,i), where u_i ~ U(0,1).
+        % Preserve the two fixed gripper joint positions.
 
         for attempt = 1:p.maxResetAttempts
             qCandidate = q;
@@ -130,6 +134,7 @@ function [InitialObs, LoggedSignals, status] = resetFunction(initialState)
                 if recordDiagnostics
                     diag.startSampleCollisionRejects = diag.startSampleCollisionRejects+1;
                 end
+                %return to the beginning of the for loop
                 continue;
             end
 
@@ -150,6 +155,7 @@ function [InitialObs, LoggedSignals, status] = resetFunction(initialState)
             q = qCandidate;
             pStart = pCandidate;
             accepted = true;
+            % Exit sampling loop because we have found a calid start
             break;
         end
 
