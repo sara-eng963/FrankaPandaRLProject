@@ -1,0 +1,51 @@
+{
+  "schema": 1,
+  "original": {
+    "path": "Training_Results/SAC_K_20261120_225730/best_reaching_agent.mat",
+    "variable": "bestReachingAgent",
+    "sha256": "72441e2dcf3d20c213f4e8364691198587c3d6a377dbc7132c2aa07e0d791e6f"
+  },
+  "standardized": {
+    "path": "Training_Results/SAC/C04/SAC_C04_Agent.mat",
+    "variable": "agent",
+    "sha256": "f5143bbc1ece1e9e214b74d3911773f2f9efbfe1fd20961e0a8ac37d258092dc"
+  },
+  "sourceCommitBeforeRefactor": "027ed8ef107bcd3846f341b26f1b13e6665f1c81",
+  "historicalEvidence": {
+    "localSuccesses": 14,
+    "localTargets": 14,
+    "workspaceSuccesses": 18,
+    "workspaceTargets": 25,
+    "workspaceAssociation": "Historical row association supplied by experiment context; no checkpoint identifier in saved comparison."
+  },
+  "limitations": [
+    "C04 is the new official identifier for Experiment K, not recovered original curriculum metadata.",
+    "Original K target ranges and full RNG/session state were not saved.",
+    "MATLAB reserialization changes bytes; compare learning state and policy behavior.",
+    "SAC internal scheduling counters are not included by the installed serializer."
+  ],
+  "verification": {
+    "date": "2026-11-23",
+    "matlab": "R2025b",
+    "localSuccesses": 14,
+    "reconstructedWorkspaceSuccesses": 18,
+    "replayExperiences": 1204,
+    "actorCriticTargetParametersEqual": true,
+    "optimizerPrivateStateEqual": true,
+    "entropyStateEqual": true,
+    "replayContentsEqual": true,
+    "greedyActionsEqualAtWorkspaceRolloutObservations": true,
+    "historicalEvaluatorMaximumFinalErrorDifferenceMetres": 1.9347163801586298e-10,
+    "historicalEvaluatorComparisonToleranceMetres": 1e-09,
+    "legacyRegressionSuitesPassed": [
+      "testForwardKinematics",
+      "testActionUpdate",
+      "testRobotCollision",
+      "testStepFunction",
+      "testGoalSampling",
+      "testTrainingEnvironment"
+    ],
+    "trainingExecuted": false,
+    "liveTrainingPersistenceTested": false
+  }
+}

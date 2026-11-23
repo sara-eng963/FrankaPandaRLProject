@@ -1,6 +1,11 @@
 # Franka Panda RL Environment — Engineering Notes
 
-Updated: 2026-10-20
+Environment foundation updated: 2026-10-20
+
+SAC reaching workflow added: 2026-11-23. See [SAC workflow](SAC-Workflow.md)
+for the C04 checkpoint, current evaluation and proposed C05 continuation.
+The pre-training status and verification statements below describe the historical
+randomized obstacle-environment foundation, not the later SAC reaching experiments.
 Course: MCT464 Selected Topics in Robotics & AI  
 Status: **Pre-training validation**; do not interpret unexecuted code as a passed test.
 

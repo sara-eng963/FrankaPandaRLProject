@@ -10,3 +10,12 @@ codegen/
 
 # Temporary files
 *.tmp
+
+# Bulk research artifacts (small benchmark fixtures may be tracked elsewhere)
+/Training Results/
+/Training_Results/
+
+# Preserved local legacy evaluation helpers; backed up externally
+/Scripts/evaluatePandaCurriculum.m
+/+environment/stepNormalizedAction.m
+/+environment/stepNormalizedWithLimitPenalty.m
